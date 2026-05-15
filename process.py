@@ -63,6 +63,19 @@ PROVIDER_MAPPING = {
     "gptimage2": "openai",
 }
 
+def _mime_to_ext(mime_type: str) -> str:
+    return {"image/jpeg": ".jpg", "image/jpg": ".jpg",
+            "image/png": ".png", "image/webp": ".webp"}.get(mime_type.lower(), ".png")
+
+def _pil_format_to_ext(fmt: str | None) -> str:
+    return {"JPEG": ".jpg", "PNG": ".png", "WEBP": ".webp"}.get(fmt or "", ".png")
+
+def _bytes_to_ext(data: bytes) -> str:
+    if data[:3] == b'\xff\xd8\xff':          return ".jpg"
+    if data[:8] == b'\x89PNG\r\n\x1a\n':     return ".png"
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP': return ".webp"
+    return ".png"
+
 async def save_image_async(image_obj_or_bytes, output_path: Path):
     """Offloads the file saving to a separate thread so it doesn't block the async event loop."""
     def _save():
@@ -74,7 +87,8 @@ async def save_image_async(image_obj_or_bytes, output_path: Path):
 
     await asyncio.to_thread(_save)
 
-async def _call_google(img: Image.Image | None, output_path: Path, model_id: str, prompt: str, image_size: str, aspect_ratio: str = None):
+async def _call_google(img: Image.Image | None, base_output: Path, model_id: str, prompt: str, image_size: str, aspect_ratio: str = None) -> Path:
+    """Calls the Gemini API and saves the result. Returns the actual saved path."""
     img_cfg = types.ImageConfig(image_size=image_size, aspect_ratio=aspect_ratio) if aspect_ratio \
               else types.ImageConfig(image_size=image_size)
     contents = [img, prompt] if img is not None else [prompt]
@@ -88,25 +102,56 @@ async def _call_google(img: Image.Image | None, output_path: Path, model_id: str
     )
 
     for part in response.parts:
-        if hasattr(part, 'as_image') and callable(part.as_image):
-            await save_image_async(part.as_image(), output_path)
-            return
-        elif part.inline_data:
+        if part.inline_data:
+            ext = _mime_to_ext(part.inline_data.mime_type)
+            output_path = base_output.with_suffix(ext)
             await save_image_async(part.inline_data.data, output_path)
-            return
+            return output_path
+        if hasattr(part, 'as_image') and callable(part.as_image):
+            pil_img = part.as_image()
+            ext = _pil_format_to_ext(pil_img.format)
+            output_path = base_output.with_suffix(ext)
+            await save_image_async(pil_img, output_path)
+            return output_path
 
     raise RuntimeError("No image data in response")
 
+ASPECT_RATIO_ALIASES = {
+    "iphone": "9:19.5",
+}
+
+_IPHONE_PAGES_RE = re.compile(r"^iphone-pages-(\d+)$", re.IGNORECASE)
+
+def _iphone_pages_ratio(n: int) -> float:
+    """Aspect ratio for N iPhone screens side-by-side with 10%-of-page-width gaps."""
+    page_w, page_h = 9.0, 19.5
+    gap = page_w * 0.10
+    return (n * page_w + (n - 1) * gap) / page_h
+
 def _parse_aspect_ratio(ar: str) -> float:
-    """Convert '16:9' string to a w/h float."""
+    """Convert a W:H string, named alias, or 'iphone-pages-N' to a w/h float."""
+    m = _IPHONE_PAGES_RE.match(ar)
+    if m:
+        return _iphone_pages_ratio(int(m.group(1)))
+    ar = ASPECT_RATIO_ALIASES.get(ar.lower(), ar)
     w, h = ar.split(":")
     return float(w) / float(h)
 
 def _aspect_ratio_arg(value: str) -> str:
-    """Argparse type validator — accepts 'W:H' strings like '16:9'."""
+    """Argparse type validator — accepts named aliases, 'iphone-pages-N', or 'W:H' strings."""
+    if _IPHONE_PAGES_RE.match(value):
+        n = int(_IPHONE_PAGES_RE.match(value).group(1))
+        if n < 1:
+            raise argparse.ArgumentTypeError("iphone-pages-N requires N >= 1")
+        return value
+    if value.lower() in ASPECT_RATIO_ALIASES:
+        return value
     parts = value.split(":")
     if len(parts) != 2:
-        raise argparse.ArgumentTypeError(f"Aspect ratio must be W:H (e.g. 16:9), got '{value}'")
+        aliases = ", ".join(ASPECT_RATIO_ALIASES) + ", iphone-pages-N"
+        raise argparse.ArgumentTypeError(
+            f"Aspect ratio must be W:H (e.g. 16:9) or a named alias ({aliases}), got '{value}'"
+        )
     try:
         w, h = float(parts[0]), float(parts[1])
         if w <= 0 or h <= 0:
@@ -173,7 +218,8 @@ def _compute_openai_size(src_w: int, src_h: int, minimize: bool = False, overrid
 
     return f"{w}x{h}"
 
-async def _call_openai(img: Image.Image | None, output_path: Path, model_id: str, prompt: str, size: str, quality: str):
+async def _call_openai(img: Image.Image | None, base_output: Path, model_id: str, prompt: str, size: str, quality: str) -> Path:
+    """Calls the OpenAI API and saves the result. Returns the actual saved path."""
     if img is not None:
         # Edit mode: send source image alongside the prompt
         def _to_buf():
@@ -203,7 +249,10 @@ async def _call_openai(img: Image.Image | None, output_path: Path, model_id: str
         )
 
     img_bytes = base64.b64decode(response.data[0].b64_json)
+    ext = _bytes_to_ext(img_bytes)
+    output_path = base_output.with_suffix(ext)
     await save_image_async(img_bytes, output_path)
+    return output_path
 
 async def _log_request(lock: asyncio.Lock, entry: dict):
     line = json.dumps(entry, ensure_ascii=False) + "\n"
@@ -215,10 +264,12 @@ async def _log_request(lock: asyncio.Lock, entry: dict):
 
 async def generate_variant(image_path: Path | None, variant_idx: int, semaphore: asyncio.Semaphore, log_lock: asyncio.Lock, model_key: str, model_id: str, suffix: str, extra_prompt: str, override_prompt: str, image_size: str, aspect_ratio: str, progress: Progress, estimates: dict):
     """Asynchronously calls the API to generate/redraw an image and saves it."""
+    # Build base path without extension — the call functions detect the real format
     if image_path is not None:
-        output_path = image_path.with_name(f"{image_path.stem}{suffix}{variant_idx}.png")
+        base_output = image_path.with_name(f"{image_path.stem}{suffix}{variant_idx}")
     else:
-        output_path = Path.cwd() / f"generated{suffix}{variant_idx}.png"
+        base_output = Path.cwd() / f"generated{suffix}{variant_idx}"
+    output_path = base_output  # will be replaced with the real path after the call
 
     final_prompt = BASE_PROMPT
     if extra_prompt:
@@ -270,9 +321,9 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
                     resolved_size, quality = "auto", "high"
                 else:
                     resolved_size, quality = _compute_openai_size(*src_dims, override_ratio=override_ratio), "high"
-                await _call_openai(img, output_path, model_id, final_prompt, resolved_size, quality)
+                output_path = await _call_openai(img, base_output, model_id, final_prompt, resolved_size, quality)
             else:
-                await _call_google(img, output_path, model_id, final_prompt, image_size, aspect_ratio)
+                output_path = await _call_google(img, base_output, model_id, final_prompt, image_size, aspect_ratio)
 
             status = "success"
             progress.print(f"✅ Saved {output_path.name}")
@@ -311,7 +362,7 @@ def _next_variant_index(image_path: Path | None, suffix: str) -> int:
     directory = image_path.parent if image_path is not None else Path.cwd()
     stem      = image_path.stem   if image_path is not None else "generated"
     pattern = re.compile(
-        rf"^{re.escape(stem)}{re.escape(suffix)}(\d+)\.png$",
+        rf"^{re.escape(stem)}{re.escape(suffix)}(\d+)\.(png|jpg|jpeg|webp)$",
         re.IGNORECASE,
     )
     max_idx = 0
@@ -368,7 +419,9 @@ def main():
     parser.add_argument("--extra-prompt", type=str, default="",
                         help="Additional text to append to the end of the base prompt.")
     parser.add_argument("--prompt", type=str, default="",
-                        help="Fully override the base prompt (--extra-prompt is ignored when this is set).")
+                        help="Fully override the base prompt. If --prompt-file is also given, this text comes first.")
+    parser.add_argument("--prompt-file", type=str, default=None,
+                        help="Path to a text file appended after --prompt (or used alone as full override).")
     parser.add_argument("--1k", action="store_true", dest="use_1k",
                         help="Use 1K resolution output instead of the default 4K.")
     parser.add_argument("--variants", type=int, default=DEFAULT_VARIANTS_PER_IMAGE,
@@ -379,7 +432,21 @@ def main():
 
     model_keys    = ["pro", "flash", "gptimage2"] if args.model == "all" else [args.model]
     extra_prompt  = args.extra_prompt
-    override_prompt = args.prompt
+
+    file_prompt = ""
+    if args.prompt_file:
+        prompt_path = Path(args.prompt_file)
+        if not prompt_path.is_file():
+            console.print(f"[red]Prompt file not found:[/red] {args.prompt_file}")
+            return
+        file_prompt = prompt_path.read_text(encoding="utf-8").strip()
+
+    if args.prompt and file_prompt:
+        override_prompt = f"{args.prompt.strip()}\n{file_prompt}"
+    elif file_prompt:
+        override_prompt = file_prompt
+    else:
+        override_prompt = args.prompt
     image_size    = "1K" if args.use_1k else "4K"
     aspect_ratio  = args.aspect_ratio
     all_suffixes  = set(SUFFIX_MAPPING.values())
