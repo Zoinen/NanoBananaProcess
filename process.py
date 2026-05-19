@@ -48,18 +48,21 @@ MAX_CONCURRENT_REQUESTS = 15 # Adjust based on your API tier's rate limits
 MODEL_MAPPING = {
     "pro":       "gemini-3-pro-image-preview",      # Nano Banana Pro
     "flash":     "gemini-3.1-flash-image-preview",  # Nano Banana 2
+    "gptimage1": "gpt-image-1",                     # GPT Image 1 (supports transparency)
     "gptimage2": "gpt-image-2",                     # GPT Image 2
 }
 
 SUFFIX_MAPPING = {
-    "pro":       "_nb_pro_",  # Nano Banana Pro
-    "flash":     "_nb_two_",  # Nano Banana 2
-    "gptimage2": "_gptimg_two_",  # GPT Image 2
+    "pro":       "_nb_pro_",     # Nano Banana Pro
+    "flash":     "_nb_two_",     # Nano Banana 2
+    "gptimage1": "_gptimg_one_", # GPT Image 1
+    "gptimage2": "_gptimg_two_", # GPT Image 2
 }
 
 PROVIDER_MAPPING = {
     "pro":       "google",
     "flash":     "google",
+    "gptimage1": "openai",
     "gptimage2": "openai",
 }
 
@@ -261,6 +264,17 @@ def _source_to_gemini_size(w: int, h: int) -> str:
     """Pick the nearest Gemini image-size preset for a given source resolution."""
     return "1K" if max(w, h) <= 1536 else "4K"
 
+# gpt-image-1 supports only these fixed presets (ratio → WxH string)
+_GPT_IMAGE_1_PRESETS = [
+    (1.0,        "1024x1024"),  # square
+    (1536/1024,  "1536x1024"),  # landscape
+    (1024/1536,  "1024x1536"),  # portrait
+]
+
+def _pick_gptimage1_size(ratio: float) -> str:
+    """Return the gpt-image-1 preset whose aspect ratio is closest to *ratio*."""
+    return min(_GPT_IMAGE_1_PRESETS, key=lambda p: abs(math.log(ratio / p[0])))[1]
+
 async def _call_openai(img: Image.Image | None, base_output: Path, model_id: str, prompt: str, size: str, quality: str, transparent: bool = False) -> Path:
     """Calls the OpenAI API and saves the result. Returns the actual saved path."""
     extra = {}
@@ -364,16 +378,29 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
             if PROVIDER_MAPPING[model_key] == "openai":
                 override_ratio = _parse_aspect_ratio(aspect_ratio) if aspect_ratio else None
                 src_dims = img.size if img is not None else (1, 1)
-                if image_size == "1K":
-                    resolved_size, quality = _compute_openai_size(*src_dims, mode="min", override_ratio=override_ratio), "medium"
-                elif image_size == "source" and img is not None:
-                    resolved_size, quality = _compute_openai_size(*src_dims, mode="source", override_ratio=override_ratio), "high"
-                elif img is None and override_ratio is None:
-                    # No source image and no ratio hint: let the API choose
-                    resolved_size, quality = "auto", "high"
+                raw_ratio = override_ratio if override_ratio is not None else (src_dims[0] / src_dims[1])
+
+                if model_key == "gptimage1":
+                    # gpt-image-1: fixed presets only; transparency supported
+                    if image_size == "1K":
+                        resolved_size, quality = "1024x1024", "medium"
+                    else:
+                        resolved_size, quality = _pick_gptimage1_size(raw_ratio), "high"
+                    use_transparent = transparent
                 else:
-                    resolved_size, quality = _compute_openai_size(*src_dims, override_ratio=override_ratio), "high"
-                output_path = await _call_openai(img, base_output, model_id, final_prompt, resolved_size, quality, transparent=transparent)
+                    # gpt-image-2: arbitrary WxH; transparency NOT supported
+                    if image_size == "1K":
+                        resolved_size, quality = _compute_openai_size(*src_dims, mode="min", override_ratio=override_ratio), "medium"
+                    elif image_size == "source" and img is not None:
+                        resolved_size, quality = _compute_openai_size(*src_dims, mode="source", override_ratio=override_ratio), "high"
+                    elif img is None and override_ratio is None:
+                        # No source image and no ratio hint: let the API choose
+                        resolved_size, quality = "auto", "high"
+                    else:
+                        resolved_size, quality = _compute_openai_size(*src_dims, override_ratio=override_ratio), "high"
+                    use_transparent = False  # gpt-image-2 rejects background=transparent
+
+                output_path = await _call_openai(img, base_output, model_id, final_prompt, resolved_size, quality, transparent=use_transparent)
             else:
                 if image_size == "source":
                     resolved_size = _source_to_gemini_size(*img.size) if img is not None else "4K"
@@ -471,8 +498,8 @@ def main():
     parser = argparse.ArgumentParser(description="Redraw images asynchronously using Gemini Image Models.")
     parser.add_argument("path", nargs="?", default=None,
                         help="Path to a single image or a folder of images. Omit to generate from prompt only.")
-    parser.add_argument("--model", choices=["pro", "flash", "gptimage2", "all"], default="pro",
-                        help="Choose 'pro' (Nano Banana Pro), 'flash' (Nano Banana 2), 'gptimage2' (GPT Image 2), or 'all' to run all three in parallel.")
+    parser.add_argument("--model", choices=["pro", "flash", "gptimage1", "gptimage2", "all"], default="pro",
+                        help="Choose 'pro' (Nano Banana Pro), 'flash' (Nano Banana 2), 'gptimage1' (GPT Image 1, supports transparency), 'gptimage2' (GPT Image 2), or 'all' to run pro+flash+gptimage2 in parallel.")
     parser.add_argument("--extra-prompt", type=str, default="",
                         help="Additional text to append to the end of the base prompt.")
     parser.add_argument("--prompt", type=str, default="",
@@ -486,7 +513,7 @@ def main():
     parser.add_argument("--aspect-ratio", type=_aspect_ratio_arg, default=None,
                         help="Output aspect ratio as W:H (e.g. 16:9, 4:3, 1:1). Defaults to source image ratio.")
     parser.add_argument("--transparent", action="store_true",
-                        help="Generate image with a transparent background (gpt-image-2 only; ignored for Gemini models).")
+                        help="Generate image with a transparent background (gpt-image-1 only; ignored for Gemini models and gpt-image-2).")
     args = parser.parse_args()
 
     model_keys    = ["pro", "flash", "gptimage2"] if args.model == "all" else [args.model]
@@ -511,9 +538,9 @@ def main():
     transparent   = args.transparent
 
     if transparent:
-        google_models = [k for k in model_keys if PROVIDER_MAPPING[k] == "google"]
-        if google_models:
-            console.print(f"[yellow]Note:[/yellow] --transparent is not supported by Gemini models ({', '.join(google_models)}) and will be ignored for them.")
+        unsupported = [k for k in model_keys if k != "gptimage1"]
+        if unsupported:
+            console.print(f"[yellow]Note:[/yellow] --transparent is only supported by gpt-image-1 and will be ignored for: {', '.join(unsupported)}")
 
     all_suffixes  = set(SUFFIX_MAPPING.values())
 
