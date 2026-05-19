@@ -160,11 +160,12 @@ def _aspect_ratio_arg(value: str) -> str:
         raise argparse.ArgumentTypeError(f"Invalid aspect ratio '{value}' — use W:H format")
     return value
 
-def _compute_openai_size(src_w: int, src_h: int, minimize: bool = False, override_ratio: float = None) -> str:
+def _compute_openai_size(src_w: int, src_h: int, mode: str = "max", override_ratio: float = None) -> str:
     """Return a WxH string satisfying gpt-image-2 constraints at the source aspect ratio.
 
-    minimize=False (default): largest valid resolution (for 4K mode).
-    minimize=True:            smallest valid resolution (for 1K mode).
+    mode="max"    (default): largest valid resolution (4K mode).
+    mode="min":              smallest valid resolution (1K mode).
+    mode="source":           stay as close to the source resolution as possible.
 
     Constraints: max edge ≤ 3840, both dims multiples of 16, ratio ≤ 3:1,
     total pixels in [655 360, 8 294 400].
@@ -179,7 +180,7 @@ def _compute_openai_size(src_w: int, src_h: int, minimize: bool = False, overrid
     raw_ratio = override_ratio if override_ratio is not None else src_w / src_h
     ratio = max(1 / MAX_RATIO, min(MAX_RATIO, raw_ratio))
 
-    if not minimize:
+    if mode == "max":
         # Fill the longest edge to MAX_EDGE, derive the other from ratio
         if ratio >= 1.0:  # landscape or square
             w, h = float(MAX_EDGE), MAX_EDGE / ratio
@@ -197,7 +198,7 @@ def _compute_openai_size(src_w: int, src_h: int, minimize: bool = False, overrid
         w = int(w) // MULTIPLE * MULTIPLE
         h = int(h) // MULTIPLE * MULTIPLE
 
-    else:
+    elif mode == "min":
         # Find the shortest edge whose square (times ratio) just meets MIN_PIXELS,
         # then round UP to the nearest multiple of 16.
         if ratio >= 1.0:  # landscape: h is short edge
@@ -216,10 +217,57 @@ def _compute_openai_size(src_w: int, src_h: int, minimize: bool = False, overrid
                 w += MULTIPLE
                 h = math.ceil(w / ratio / MULTIPLE) * MULTIPLE
 
+    else:  # "source" — preserve source resolution, clamped to API limits
+        w, h = float(src_w), float(src_h)
+
+        # Apply override_ratio by rescaling while preserving total pixel count
+        if override_ratio is not None:
+            total = w * h
+            if ratio >= 1.0:
+                h = math.sqrt(total / ratio)
+                w = h * ratio
+            else:
+                w = math.sqrt(total * ratio)
+                h = w / ratio
+
+        # Clamp max edge, then enforce pixel floor/ceiling
+        if max(w, h) > MAX_EDGE:
+            scale = MAX_EDGE / max(w, h)
+            w *= scale; h *= scale
+        if w * h < MIN_PIXELS:
+            scale = math.sqrt(MIN_PIXELS / (w * h))
+            w *= scale; h *= scale
+        if w * h > MAX_PIXELS:
+            scale = math.sqrt(MAX_PIXELS / (w * h))
+            w *= scale; h *= scale
+
+        # Snap to multiples of 16 (round down)
+        w = int(w) // MULTIPLE * MULTIPLE
+        h = int(h) // MULTIPLE * MULTIPLE
+
+        # Post-snap correction if we fell below minimum
+        while w * h < MIN_PIXELS:
+            if ratio >= 1.0:
+                h += MULTIPLE
+                w = math.ceil(h * ratio / MULTIPLE) * MULTIPLE
+            else:
+                w += MULTIPLE
+                h = math.ceil(w / ratio / MULTIPLE) * MULTIPLE
+
     return f"{w}x{h}"
 
-async def _call_openai(img: Image.Image | None, base_output: Path, model_id: str, prompt: str, size: str, quality: str) -> Path:
+
+def _source_to_gemini_size(w: int, h: int) -> str:
+    """Pick the nearest Gemini image-size preset for a given source resolution."""
+    return "1K" if max(w, h) <= 1536 else "4K"
+
+async def _call_openai(img: Image.Image | None, base_output: Path, model_id: str, prompt: str, size: str, quality: str, transparent: bool = False) -> Path:
     """Calls the OpenAI API and saves the result. Returns the actual saved path."""
+    extra = {}
+    if transparent:
+        extra["background"] = "transparent"
+        extra["output_format"] = "png"   # JPEG has no alpha channel
+
     if img is not None:
         # Edit mode: send source image alongside the prompt
         def _to_buf():
@@ -237,6 +285,7 @@ async def _call_openai(img: Image.Image | None, base_output: Path, model_id: str
             size=size,
             quality=quality,
             n=1,
+            **extra,
         )
     else:
         # Generate mode: pure prompt, no source image
@@ -246,6 +295,7 @@ async def _call_openai(img: Image.Image | None, base_output: Path, model_id: str
             size=size,
             quality=quality,
             n=1,
+            **extra,
         )
 
     img_bytes = base64.b64decode(response.data[0].b64_json)
@@ -262,7 +312,7 @@ async def _log_request(lock: asyncio.Lock, entry: dict):
                 f.write(line)
         await asyncio.to_thread(_write)
 
-async def generate_variant(image_path: Path | None, variant_idx: int, semaphore: asyncio.Semaphore, log_lock: asyncio.Lock, model_key: str, model_id: str, suffix: str, extra_prompt: str, override_prompt: str, image_size: str, aspect_ratio: str, progress: Progress, estimates: dict):
+async def generate_variant(image_path: Path | None, variant_idx: int, semaphore: asyncio.Semaphore, log_lock: asyncio.Lock, model_key: str, model_id: str, suffix: str, extra_prompt: str, override_prompt: str, image_size: str, aspect_ratio: str, progress: Progress, estimates: dict, transparent: bool = False):
     """Asynchronously calls the API to generate/redraw an image and saves it."""
     # Build base path without extension — the call functions detect the real format
     if image_path is not None:
@@ -315,15 +365,21 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
                 override_ratio = _parse_aspect_ratio(aspect_ratio) if aspect_ratio else None
                 src_dims = img.size if img is not None else (1, 1)
                 if image_size == "1K":
-                    resolved_size, quality = _compute_openai_size(*src_dims, minimize=True, override_ratio=override_ratio), "medium"
+                    resolved_size, quality = _compute_openai_size(*src_dims, mode="min", override_ratio=override_ratio), "medium"
+                elif image_size == "source" and img is not None:
+                    resolved_size, quality = _compute_openai_size(*src_dims, mode="source", override_ratio=override_ratio), "high"
                 elif img is None and override_ratio is None:
                     # No source image and no ratio hint: let the API choose
                     resolved_size, quality = "auto", "high"
                 else:
                     resolved_size, quality = _compute_openai_size(*src_dims, override_ratio=override_ratio), "high"
-                output_path = await _call_openai(img, base_output, model_id, final_prompt, resolved_size, quality)
+                output_path = await _call_openai(img, base_output, model_id, final_prompt, resolved_size, quality, transparent=transparent)
             else:
-                output_path = await _call_google(img, base_output, model_id, final_prompt, image_size, aspect_ratio)
+                if image_size == "source":
+                    resolved_size = _source_to_gemini_size(*img.size) if img is not None else "4K"
+                else:
+                    resolved_size = image_size
+                output_path = await _call_google(img, base_output, model_id, final_prompt, resolved_size, aspect_ratio)
 
             status = "success"
             progress.print(f"✅ Saved {output_path.name}")
@@ -351,6 +407,7 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
                 "aspect_ratio":     aspect_ratio,
                 "resolved_size":    resolved_size,
                 "quality":          quality,
+                "transparent":      transparent,
                 "prompt":           final_prompt,
                 "status":           status,
                 "error":            error_msg,
@@ -372,7 +429,7 @@ def _next_variant_index(image_path: Path | None, suffix: str) -> int:
             max_idx = max(max_idx, int(m.group(1)))
     return max_idx + 1
 
-async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str):
+async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     log_lock  = asyncio.Lock()
     estimates = _load_estimates()
@@ -403,7 +460,7 @@ async def async_main(image_files: list[Path], model_keys: list[str], extra_promp
                 suffix = SUFFIX_MAPPING[model_key]
                 start_idx = _next_variant_index(img_path, suffix)
                 for i in range(start_idx, start_idx + variants):
-                    tasks.append(generate_variant(img_path, i, semaphore, log_lock, model_key, model_id, suffix, extra_prompt, override_prompt, image_size, aspect_ratio, progress, estimates))
+                    tasks.append(generate_variant(img_path, i, semaphore, log_lock, model_key, model_id, suffix, extra_prompt, override_prompt, image_size, aspect_ratio, progress, estimates, transparent=transparent))
 
         console.print(f"Firing off {len(tasks)} requests...")
         await asyncio.gather(*tasks)
@@ -422,12 +479,14 @@ def main():
                         help="Fully override the base prompt. If --prompt-file is also given, this text comes first.")
     parser.add_argument("--prompt-file", type=str, default=None,
                         help="Path to a text file appended after --prompt (or used alone as full override).")
-    parser.add_argument("--1k", action="store_true", dest="use_1k",
-                        help="Use 1K resolution output instead of the default 4K.")
+    parser.add_argument("--resolution", choices=["1k", "4k", "source"], default="4k",
+                        help="Output resolution: '1k', '4k' (default), or 'source' to match input image dimensions.")
     parser.add_argument("--variants", type=int, default=DEFAULT_VARIANTS_PER_IMAGE,
                         help=f"Number of variants to generate per image (default: {DEFAULT_VARIANTS_PER_IMAGE}).")
     parser.add_argument("--aspect-ratio", type=_aspect_ratio_arg, default=None,
                         help="Output aspect ratio as W:H (e.g. 16:9, 4:3, 1:1). Defaults to source image ratio.")
+    parser.add_argument("--transparent", action="store_true",
+                        help="Generate image with a transparent background (gpt-image-2 only; ignored for Gemini models).")
     args = parser.parse_args()
 
     model_keys    = ["pro", "flash", "gptimage2"] if args.model == "all" else [args.model]
@@ -447,8 +506,15 @@ def main():
         override_prompt = file_prompt
     else:
         override_prompt = args.prompt
-    image_size    = "1K" if args.use_1k else "4K"
+    image_size    = {"1k": "1K", "4k": "4K", "source": "source"}[args.resolution]
     aspect_ratio  = args.aspect_ratio
+    transparent   = args.transparent
+
+    if transparent:
+        google_models = [k for k in model_keys if PROVIDER_MAPPING[k] == "google"]
+        if google_models:
+            console.print(f"[yellow]Note:[/yellow] --transparent is not supported by Gemini models ({', '.join(google_models)}) and will be ignored for them.")
+
     all_suffixes  = set(SUFFIX_MAPPING.values())
 
     image_files = []
@@ -473,7 +539,7 @@ def main():
             console.print("[yellow]Warning:[/yellow] no source image and no --prompt given — the default redraw prompt will be used as-is.")
 
 
-    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio))
+    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, transparent=transparent))
 
 if __name__ == "__main__":
     main()
