@@ -123,7 +123,8 @@ ASPECT_RATIO_ALIASES = {
     "iphone": "9:19.5",
 }
 
-_IPHONE_PAGES_RE = re.compile(r"^iphone-pages-(\d+)$", re.IGNORECASE)
+_IPHONE_PAGES_RE  = re.compile(r"^iphone-pages-(\d+)$", re.IGNORECASE)
+_CUSTOM_SIZE_RE   = re.compile(r"^(\d+)x(\d+)$", re.IGNORECASE)
 
 def _iphone_pages_ratio(n: int) -> float:
     """Aspect ratio for N iPhone screens side-by-side with 10%-of-page-width gaps."""
@@ -139,6 +140,20 @@ def _parse_aspect_ratio(ar: str) -> float:
     ar = ASPECT_RATIO_ALIASES.get(ar.lower(), ar)
     w, h = ar.split(":")
     return float(w) / float(h)
+
+def _resolution_arg(value: str) -> str:
+    """Argparse type for --resolution: keywords or exact WxH (e.g. 1920x1080)."""
+    if value.lower() in ("1k", "4k", "source"):
+        return value.lower()
+    m = _CUSTOM_SIZE_RE.match(value)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+        if w < 1 or h < 1:
+            raise argparse.ArgumentTypeError("Resolution dimensions must be positive integers")
+        return f"{w}x{h}"
+    raise argparse.ArgumentTypeError(
+        f"Invalid resolution '{value}'. Use '1k', '4k', 'source', or WxH (e.g. 1920x1080)."
+    )
 
 def _aspect_ratio_arg(value: str) -> str:
     """Argparse type validator — accepts named aliases, 'iphone-pages-N', or 'W:H' strings."""
@@ -384,6 +399,9 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
                     # gpt-image-1: fixed presets only; transparency supported
                     if image_size == "1K":
                         resolved_size, quality = "1024x1024", "medium"
+                    elif _CUSTOM_SIZE_RE.match(image_size):
+                        cw, ch = map(int, image_size.split("x"))
+                        resolved_size, quality = _pick_gptimage1_size(override_ratio or (cw / ch)), "high"
                     else:
                         resolved_size, quality = _pick_gptimage1_size(raw_ratio), "high"
                     use_transparent = transparent
@@ -393,6 +411,9 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
                         resolved_size, quality = _compute_openai_size(*src_dims, mode="min", override_ratio=override_ratio), "medium"
                     elif image_size == "source" and img is not None:
                         resolved_size, quality = _compute_openai_size(*src_dims, mode="source", override_ratio=override_ratio), "high"
+                    elif _CUSTOM_SIZE_RE.match(image_size):
+                        cw, ch = map(int, image_size.split("x"))
+                        resolved_size, quality = _compute_openai_size(cw, ch, mode="source", override_ratio=override_ratio), "high"
                     elif img is None and override_ratio is None:
                         # No source image and no ratio hint: let the API choose
                         resolved_size, quality = "auto", "high"
@@ -404,6 +425,9 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
             else:
                 if image_size == "source":
                     resolved_size = _source_to_gemini_size(*img.size) if img is not None else "4K"
+                elif _CUSTOM_SIZE_RE.match(image_size):
+                    cw, ch = map(int, image_size.split("x"))
+                    resolved_size = _source_to_gemini_size(cw, ch)
                 else:
                     resolved_size = image_size
                 output_path = await _call_google(img, base_output, model_id, final_prompt, resolved_size, aspect_ratio)
@@ -506,8 +530,8 @@ def main():
                         help="Fully override the base prompt. If --prompt-file is also given, this text comes first.")
     parser.add_argument("--prompt-file", type=str, default=None,
                         help="Path to a text file appended after --prompt (or used alone as full override).")
-    parser.add_argument("--resolution", choices=["1k", "4k", "source"], default="4k",
-                        help="Output resolution: '1k', '4k' (default), or 'source' to match input image dimensions.")
+    parser.add_argument("--resolution", type=_resolution_arg, default="4k",
+                        help="Output resolution: '1k', '4k' (default), 'source' to match input image dimensions, or exact WxH (e.g. 1920x1080).")
     parser.add_argument("--variants", type=int, default=DEFAULT_VARIANTS_PER_IMAGE,
                         help=f"Number of variants to generate per image (default: {DEFAULT_VARIANTS_PER_IMAGE}).")
     parser.add_argument("--aspect-ratio", type=_aspect_ratio_arg, default=None,
@@ -533,7 +557,7 @@ def main():
         override_prompt = file_prompt
     else:
         override_prompt = args.prompt
-    image_size    = {"1k": "1K", "4k": "4K", "source": "source"}[args.resolution]
+    image_size    = {"1k": "1K", "4k": "4K", "source": "source"}.get(args.resolution, args.resolution)
     aspect_ratio  = args.aspect_ratio
     transparent   = args.transparent
 
