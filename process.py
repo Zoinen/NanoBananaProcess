@@ -389,9 +389,12 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
     if override_prompt:
         final_prompt = override_prompt.strip()
 
-    # --alpha always wins — it replaces every other prompt setting
+    # --alpha always wins — it replaces every other prompt setting, but still
+    # allows --extra-prompt to append additional instructions
     if alpha_mode:
         final_prompt = ALPHA_PROMPT
+        if extra_prompt:
+            final_prompt = f"{ALPHA_PROMPT}. {extra_prompt.strip()}"
 
     async with semaphore:
         estimated = estimates.get((model_key, image_size))
