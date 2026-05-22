@@ -104,7 +104,7 @@ async def _compose_alpha_async(source_path: Path, mask_path: Path) -> Path:
 
         r, g, b, _ = src.split()
         composed = Image.merge("RGBA", (r, g, b, alpha))
-        out_path = mask_path.with_stem(mask_path.stem + "_composed")
+        out_path = mask_path.with_stem(mask_path.stem + "_composed").with_suffix(".png")
         composed.save(out_path, format="PNG")
         return out_path
 
@@ -475,6 +475,7 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
 
             if alpha_mode and image_path is not None:
                 composed_path = await _compose_alpha_async(image_path, output_path)
+                await asyncio.to_thread(output_path.unlink)
                 progress.print(f"🔀 Composed {composed_path.name}")
 
         except Exception as e:
