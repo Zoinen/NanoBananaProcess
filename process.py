@@ -42,6 +42,7 @@ def _load_estimates() -> dict:
 
 # Configuration variables
 BASE_PROMPT = "redraw this as if it was a professional photo taken on a modern high quality DSLR camera, but keep all the details as close to original as possible"
+ALPHA_PROMPT = "draw alpha channel for this image. Background should be transparent and the foreground should be not"
 DEFAULT_VARIANTS_PER_IMAGE = 3
 MAX_CONCURRENT_REQUESTS = 15 # Adjust based on your API tier's rate limits
 
@@ -78,6 +79,36 @@ def _bytes_to_ext(data: bytes) -> str:
     if data[:8] == b'\x89PNG\r\n\x1a\n':     return ".png"
     if data[:4] == b'RIFF' and data[8:12] == b'WEBP': return ".webp"
     return ".png"
+
+async def _compose_alpha_async(source_path: Path, mask_path: Path) -> Path:
+    """Compose source RGB with generated mask as alpha → RGBA PNG.
+
+    The mask is converted to a grayscale alpha channel (white=opaque,
+    black=transparent). If the mask already has an alpha channel, that
+    channel is used directly. Resizes the alpha to match source if needed.
+    Saves the result as <mask_stem>_composed.png beside the mask file.
+    """
+    def _compose():
+        src = Image.open(source_path).convert("RGBA")
+        mask_img = Image.open(mask_path)
+
+        # Prefer the mask's own alpha channel; fall back to luminance
+        if mask_img.mode == "RGBA":
+            alpha = mask_img.split()[3]
+        else:
+            alpha = mask_img.convert("L")
+
+        # Align to source dimensions if the model returned a different size
+        if alpha.size != src.size:
+            alpha = alpha.resize(src.size, Image.LANCZOS)
+
+        r, g, b, _ = src.split()
+        composed = Image.merge("RGBA", (r, g, b, alpha))
+        out_path = mask_path.with_stem(mask_path.stem + "_composed")
+        composed.save(out_path, format="PNG")
+        return out_path
+
+    return await asyncio.to_thread(_compose)
 
 async def save_image_async(image_obj_or_bytes, output_path: Path):
     """Offloads the file saving to a separate thread so it doesn't block the async event loop."""
@@ -341,7 +372,7 @@ async def _log_request(lock: asyncio.Lock, entry: dict):
                 f.write(line)
         await asyncio.to_thread(_write)
 
-async def generate_variant(image_path: Path | None, variant_idx: int, semaphore: asyncio.Semaphore, log_lock: asyncio.Lock, model_key: str, model_id: str, suffix: str, extra_prompt: str, override_prompt: str, image_size: str, aspect_ratio: str, progress: Progress, estimates: dict, transparent: bool = False):
+async def generate_variant(image_path: Path | None, variant_idx: int, semaphore: asyncio.Semaphore, log_lock: asyncio.Lock, model_key: str, model_id: str, suffix: str, extra_prompt: str, override_prompt: str, image_size: str, aspect_ratio: str, progress: Progress, estimates: dict, transparent: bool = False, alpha_mode: bool = False):
     """Asynchronously calls the API to generate/redraw an image and saves it."""
     # Build base path without extension — the call functions detect the real format
     if image_path is not None:
@@ -357,6 +388,10 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
     # --prompt fully replaces the base prompt when provided
     if override_prompt:
         final_prompt = override_prompt.strip()
+
+    # --alpha always wins — it replaces every other prompt setting
+    if alpha_mode:
+        final_prompt = ALPHA_PROMPT
 
     async with semaphore:
         estimated = estimates.get((model_key, image_size))
@@ -435,6 +470,10 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
             status = "success"
             progress.print(f"✅ Saved {output_path.name}")
 
+            if alpha_mode and image_path is not None:
+                composed_path = await _compose_alpha_async(image_path, output_path)
+                progress.print(f"🔀 Composed {composed_path.name}")
+
         except Exception as e:
             error_msg = str(e)
             progress.print(f"❌ Error: {output_path.name}: {e}")
@@ -480,7 +519,7 @@ def _next_variant_index(image_path: Path | None, suffix: str) -> int:
             max_idx = max(max_idx, int(m.group(1)))
     return max_idx + 1
 
-async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False):
+async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False, alpha_mode: bool = False):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     log_lock  = asyncio.Lock()
     estimates = _load_estimates()
@@ -511,7 +550,7 @@ async def async_main(image_files: list[Path], model_keys: list[str], extra_promp
                 suffix = SUFFIX_MAPPING[model_key]
                 start_idx = _next_variant_index(img_path, suffix)
                 for i in range(start_idx, start_idx + variants):
-                    tasks.append(generate_variant(img_path, i, semaphore, log_lock, model_key, model_id, suffix, extra_prompt, override_prompt, image_size, aspect_ratio, progress, estimates, transparent=transparent))
+                    tasks.append(generate_variant(img_path, i, semaphore, log_lock, model_key, model_id, suffix, extra_prompt, override_prompt, image_size, aspect_ratio, progress, estimates, transparent=transparent, alpha_mode=alpha_mode))
 
         console.print(f"Firing off {len(tasks)} requests...")
         await asyncio.gather(*tasks)
@@ -538,6 +577,8 @@ def main():
                         help="Output aspect ratio as W:H (e.g. 16:9, 4:3, 1:1). Defaults to source image ratio.")
     parser.add_argument("--transparent", action="store_true",
                         help="Generate image with a transparent background (gpt-image-1 only; ignored for Gemini models and gpt-image-2).")
+    parser.add_argument("--alpha", action="store_true",
+                        help="Alpha-mask mode: generate a grayscale alpha mask for the source image, then compose it with the source RGB into a final RGBA PNG.")
     args = parser.parse_args()
 
     model_keys    = ["pro", "flash", "gptimage2"] if args.model == "all" else [args.model]
@@ -566,6 +607,10 @@ def main():
         if unsupported:
             console.print(f"[yellow]Note:[/yellow] --transparent is only supported by gpt-image-1 and will be ignored for: {', '.join(unsupported)}")
 
+    alpha_mode = args.alpha
+    if alpha_mode and not args.path:
+        console.print("[yellow]Note:[/yellow] --alpha has no effect in prompt-only mode (no source image to composite).")
+
     all_suffixes  = set(SUFFIX_MAPPING.values())
 
     image_files = []
@@ -590,7 +635,7 @@ def main():
             console.print("[yellow]Warning:[/yellow] no source image and no --prompt given — the default redraw prompt will be used as-is.")
 
 
-    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, transparent=transparent))
+    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, transparent=transparent, alpha_mode=alpha_mode))
 
 if __name__ == "__main__":
     main()
