@@ -45,6 +45,7 @@ BASE_PROMPT = "redraw this as if it was a professional photo taken on a modern h
 ALPHA_PROMPT = "draw alpha channel for this image. Background should be transparent and the foreground should be not"
 DEFAULT_VARIANTS_PER_IMAGE = 3
 MAX_CONCURRENT_REQUESTS = 15 # Adjust based on your API tier's rate limits
+MAX_OPENAI_IMAGE_BYTES  = 50 * 1024 * 1024  # OpenAI hard limit for input images
 
 MODEL_MAPPING = {
     "pro":       "gemini-3-pro-image-preview",      # Nano Banana Pro
@@ -331,8 +332,18 @@ async def _call_openai(img: Image.Image | None, base_output: Path, model_id: str
     if img is not None:
         # Edit mode: send source image alongside the prompt
         def _to_buf():
+            work = img
             buf = io.BytesIO()
-            img.save(buf, format="PNG")
+            work.save(buf, format="PNG")
+            # Scale down iteratively if the PNG exceeds the 50 MB API limit
+            while buf.tell() > MAX_OPENAI_IMAGE_BYTES:
+                scale = math.sqrt(MAX_OPENAI_IMAGE_BYTES / buf.tell()) * 0.92
+                work = work.resize(
+                    (max(1, int(work.width * scale)), max(1, int(work.height * scale))),
+                    Image.LANCZOS,
+                )
+                buf = io.BytesIO()
+                work.save(buf, format="PNG")
             buf.seek(0)
             buf.name = "image.png"
             return buf
