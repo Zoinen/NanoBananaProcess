@@ -574,8 +574,8 @@ async def async_main(image_files: list[Path], model_keys: list[str], extra_promp
 
 def main():
     parser = argparse.ArgumentParser(description="Redraw images asynchronously using Gemini Image Models.")
-    parser.add_argument("path", nargs="?", default=None,
-                        help="Path to a single image or a folder of images. Omit to generate from prompt only.")
+    parser.add_argument("paths", nargs="*", default=[],
+                        help="One or more image files or folders. Mix freely. Omit to generate from prompt only.")
     parser.add_argument("--model", choices=["pro", "flash", "gptimage1", "gptimage2", "both", "all"], default="pro",
                         help="Choose 'pro' (Nano Banana Pro), 'flash' (Nano Banana 2), 'gptimage1' (GPT Image 1, supports transparency), 'gptimage2' (GPT Image 2), 'both' (pro + gptimage2), or 'all' (pro + flash + gptimage2) in parallel.")
     parser.add_argument("--extra-prompt", type=str, default="",
@@ -623,7 +623,7 @@ def main():
             console.print(f"[yellow]Note:[/yellow] --transparent is only supported by gpt-image-1 and will be ignored for: {', '.join(unsupported)}")
 
     alpha_mode = args.alpha
-    if alpha_mode and not args.path:
+    if alpha_mode and not args.paths:
         console.print("[yellow]Note:[/yellow] --alpha has no effect in prompt-only mode (no source image to composite).")
 
     all_suffixes  = set(SUFFIX_MAPPING.values())
@@ -631,15 +631,19 @@ def main():
     image_files = []
     valid_exts  = {".jpg", ".jpeg", ".png", ".webp"}
 
-    if args.path is not None:
-        input_path = Path(args.path)
-        if input_path.is_file():
-            image_files.append(input_path)
-        elif input_path.is_dir():
-            image_files = [p for p in input_path.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
-        else:
-            console.print("Invalid path provided.")
-            return
+    if args.paths:
+        for raw in args.paths:
+            input_path = Path(raw)
+            if input_path.is_file():
+                image_files.append(input_path)
+            elif input_path.is_dir():
+                image_files.extend(
+                    p for p in input_path.iterdir()
+                    if p.is_file() and p.suffix.lower() in valid_exts
+                )
+            else:
+                console.print(f"[red]Invalid path:[/red] {raw}")
+                return
         image_files = [f for f in image_files if not any(s in f.stem for s in all_suffixes)]
         if not image_files:
             console.print("No valid, unprocessed images found.")
