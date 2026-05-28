@@ -122,11 +122,11 @@ async def save_image_async(image_obj_or_bytes, output_path: Path):
 
     await asyncio.to_thread(_save)
 
-async def _call_google(img: Image.Image | None, base_output: Path, model_id: str, prompt: str, image_size: str, aspect_ratio: str = None) -> Path:
+async def _call_google(imgs: list[Image.Image], base_output: Path, model_id: str, prompt: str, image_size: str, aspect_ratio: str = None) -> Path:
     """Calls the Gemini API and saves the result. Returns the actual saved path."""
     img_cfg = types.ImageConfig(image_size=image_size, aspect_ratio=aspect_ratio) if aspect_ratio \
               else types.ImageConfig(image_size=image_size)
-    contents = [img, prompt] if img is not None else [prompt]
+    contents = [*imgs, prompt] if imgs else [prompt]
     response = await google_client.aio.models.generate_content(
         model=model_id,
         contents=contents,
@@ -322,36 +322,39 @@ def _pick_gptimage1_size(ratio: float) -> str:
     """Return the gpt-image-1 preset whose aspect ratio is closest to *ratio*."""
     return min(_GPT_IMAGE_1_PRESETS, key=lambda p: abs(math.log(ratio / p[0])))[1]
 
-async def _call_openai(img: Image.Image | None, base_output: Path, model_id: str, prompt: str, size: str, quality: str, transparent: bool = False) -> Path:
+async def _call_openai(imgs: list[Image.Image], base_output: Path, model_id: str, prompt: str, size: str, quality: str, transparent: bool = False) -> Path:
     """Calls the OpenAI API and saves the result. Returns the actual saved path."""
     extra = {}
     if transparent:
         extra["background"] = "transparent"
         extra["output_format"] = "png"   # JPEG has no alpha channel
 
-    if img is not None:
-        # Edit mode: send source image alongside the prompt
-        def _to_buf():
-            work = img
-            buf = io.BytesIO()
-            work.save(buf, format="PNG")
-            # Scale down iteratively if the PNG exceeds the 50 MB API limit
-            while buf.tell() > MAX_OPENAI_IMAGE_BYTES:
-                scale = math.sqrt(MAX_OPENAI_IMAGE_BYTES / buf.tell()) * 0.92
-                work = work.resize(
-                    (max(1, int(work.width * scale)), max(1, int(work.height * scale))),
-                    Image.LANCZOS,
-                )
+    if imgs:
+        # Edit mode: send one or more source images alongside the prompt
+        def _to_bufs():
+            bufs = []
+            for img in imgs:
+                work = img
                 buf = io.BytesIO()
                 work.save(buf, format="PNG")
-            buf.seek(0)
-            buf.name = "image.png"
-            return buf
+                # Scale down iteratively if the PNG exceeds the 50 MB API limit
+                while buf.tell() > MAX_OPENAI_IMAGE_BYTES:
+                    scale = math.sqrt(MAX_OPENAI_IMAGE_BYTES / buf.tell()) * 0.92
+                    work = work.resize(
+                        (max(1, int(work.width * scale)), max(1, int(work.height * scale))),
+                        Image.LANCZOS,
+                    )
+                    buf = io.BytesIO()
+                    work.save(buf, format="PNG")
+                buf.seek(0)
+                buf.name = "image.png"
+                bufs.append(buf)
+            return bufs
 
-        buf = await asyncio.to_thread(_to_buf)
+        bufs = await asyncio.to_thread(_to_bufs)
         response = await openai_client.images.edit(
             model=model_id,
-            image=buf,
+            image=bufs[0] if len(bufs) == 1 else bufs,
             prompt=prompt,
             size=size,
             quality=quality,
@@ -383,13 +386,15 @@ async def _log_request(lock: asyncio.Lock, entry: dict):
                 f.write(line)
         await asyncio.to_thread(_write)
 
-async def generate_variant(image_path: Path | None, variant_idx: int, semaphore: asyncio.Semaphore, log_lock: asyncio.Lock, model_key: str, model_id: str, suffix: str, extra_prompt: str, override_prompt: str, image_size: str, aspect_ratio: str, progress: Progress, estimates: dict, transparent: bool = False, alpha_mode: bool = False):
+async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore: asyncio.Semaphore, log_lock: asyncio.Lock, model_key: str, model_id: str, suffix: str, extra_prompt: str, override_prompt: str, image_size: str, aspect_ratio: str, progress: Progress, estimates: dict, transparent: bool = False, alpha_mode: bool = False):
     """Asynchronously calls the API to generate/redraw an image and saves it."""
     # Build base path without extension — the call functions detect the real format
-    if image_path is not None:
-        base_output = image_path.with_name(f"{image_path.stem}{suffix}{variant_idx}")
-    else:
+    if not image_paths:
         base_output = Path.cwd() / f"generated{suffix}{variant_idx}"
+    elif len(image_paths) == 1:
+        base_output = image_paths[0].with_name(f"{image_paths[0].stem}{suffix}{variant_idx}")
+    else:
+        base_output = image_paths[0].with_name(f"combined{suffix}{variant_idx}")
     output_path = base_output  # will be replaced with the real path after the call
 
     final_prompt = BASE_PROMPT
@@ -410,7 +415,12 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
     async with semaphore:
         estimated = estimates.get((model_key, image_size))
         est_label = f"/ ~{estimated:.0f}s" if estimated else "/ ?"
-        src_label = image_path.name if image_path is not None else "[italic]prompt only[/italic]"
+        if not image_paths:
+            src_label = "[italic]prompt only[/italic]"
+        elif len(image_paths) == 1:
+            src_label = image_paths[0].name
+        else:
+            src_label = f"{image_paths[0].name} +{len(image_paths)-1} more"
         task_id = progress.add_task(
             f"{src_label}  [dim]{model_key}/{image_size}[/dim]",
             total=100,
@@ -431,17 +441,20 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
         ticker = asyncio.create_task(_tick())
 
         try:
-            img = None
-            if image_path is not None:
-                def _load_img():
-                    src = Image.open(image_path)
-                    src.load()
-                    return src
-                img = await asyncio.to_thread(_load_img)
+            imgs = []
+            if image_paths:
+                def _load_imgs():
+                    loaded = []
+                    for p in image_paths:
+                        src = Image.open(p)
+                        src.load()
+                        loaded.append(src)
+                    return loaded
+                imgs = await asyncio.to_thread(_load_imgs)
 
             if PROVIDER_MAPPING[model_key] == "openai":
                 override_ratio = _parse_aspect_ratio(aspect_ratio) if aspect_ratio else None
-                src_dims = img.size if img is not None else (1, 1)
+                src_dims = imgs[0].size if imgs else (1, 1)
                 raw_ratio = override_ratio if override_ratio is not None else (src_dims[0] / src_dims[1])
 
                 if model_key == "gptimage1":
@@ -458,34 +471,34 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
                     # gpt-image-2: arbitrary WxH; transparency NOT supported
                     if image_size == "1K":
                         resolved_size, quality = _compute_openai_size(*src_dims, mode="min", override_ratio=override_ratio), "medium"
-                    elif image_size == "source" and img is not None:
+                    elif image_size == "source" and imgs:
                         resolved_size, quality = _compute_openai_size(*src_dims, mode="source", override_ratio=override_ratio), "high"
                     elif _CUSTOM_SIZE_RE.match(image_size):
                         cw, ch = map(int, image_size.split("x"))
                         resolved_size, quality = _compute_openai_size(cw, ch, mode="source", override_ratio=override_ratio), "high"
-                    elif img is None and override_ratio is None:
+                    elif not imgs and override_ratio is None:
                         # No source image and no ratio hint: let the API choose
                         resolved_size, quality = "auto", "high"
                     else:
                         resolved_size, quality = _compute_openai_size(*src_dims, override_ratio=override_ratio), "high"
                     use_transparent = False  # gpt-image-2 rejects background=transparent
 
-                output_path = await _call_openai(img, base_output, model_id, final_prompt, resolved_size, quality, transparent=use_transparent)
+                output_path = await _call_openai(imgs, base_output, model_id, final_prompt, resolved_size, quality, transparent=use_transparent)
             else:
                 if image_size == "source":
-                    resolved_size = _source_to_gemini_size(*img.size) if img is not None else "4K"
+                    resolved_size = _source_to_gemini_size(*imgs[0].size) if imgs else "4K"
                 elif _CUSTOM_SIZE_RE.match(image_size):
                     cw, ch = map(int, image_size.split("x"))
                     resolved_size = _source_to_gemini_size(cw, ch)
                 else:
                     resolved_size = image_size
-                output_path = await _call_google(img, base_output, model_id, final_prompt, resolved_size, aspect_ratio)
+                output_path = await _call_google(imgs, base_output, model_id, final_prompt, resolved_size, aspect_ratio)
 
             status = "success"
             progress.print(f"✅ Saved {output_path.name}")
 
-            if alpha_mode and image_path is not None:
-                composed_path = await _compose_alpha_async(image_path, output_path)
+            if alpha_mode and image_paths:
+                composed_path = await _compose_alpha_async(image_paths[0], output_path)
                 await asyncio.to_thread(output_path.unlink)
                 progress.print(f"🔀 Composed {composed_path.name}")
 
@@ -503,7 +516,7 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
                 "timestamp_start":  t_start.isoformat(),
                 "timestamp_end":    t_end.isoformat(),
                 "duration_seconds": round((t_end - t_start).total_seconds(), 3),
-                "source":           image_path.name if image_path is not None else None,
+                "source":           image_paths[0].name if len(image_paths) == 1 else [p.name for p in image_paths] if image_paths else None,
                 "output":           output_path.name,
                 "model_key":        model_key,
                 "model_id":         model_id,
@@ -518,11 +531,14 @@ async def generate_variant(image_path: Path | None, variant_idx: int, semaphore:
                 "error":            error_msg,
             })
 
-def _next_variant_index(image_path: Path | None, suffix: str) -> int:
-    """Return the next available variant index for this image+suffix pair.
-    When image_path is None (prompt-only mode), scans CWD for 'generated{suffix}N.png'."""
-    directory = image_path.parent if image_path is not None else Path.cwd()
-    stem      = image_path.stem   if image_path is not None else "generated"
+def _next_variant_index(image_paths: list[Path], suffix: str) -> int:
+    """Return the next available variant index for this image+suffix pair."""
+    if not image_paths:
+        directory, stem = Path.cwd(), "generated"
+    elif len(image_paths) == 1:
+        directory, stem = image_paths[0].parent, image_paths[0].stem
+    else:
+        directory, stem = image_paths[0].parent, "combined"
     pattern = re.compile(
         rf"^{re.escape(stem)}{re.escape(suffix)}(\d+)\.(png|jpg|jpeg|webp)$",
         re.IGNORECASE,
@@ -534,18 +550,23 @@ def _next_variant_index(image_path: Path | None, suffix: str) -> int:
             max_idx = max(max_idx, int(m.group(1)))
     return max_idx + 1
 
-async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False, alpha_mode: bool = False):
+async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False, alpha_mode: bool = False, combine: bool = False):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     log_lock  = asyncio.Lock()
     estimates = _load_estimates()
 
     model_desc   = " + ".join(MODEL_MAPPING[k] for k in model_keys)
     prompt_only  = not image_files
-    sources      = image_files if not prompt_only else [None]
 
+    # sources is a list of image-path lists; each entry becomes one request per variant
     if prompt_only:
+        sources = [[]]
         console.print(f"Prompt-only mode. Generating {variants} variant(s) per model — {model_desc}")
+    elif combine:
+        sources = [image_files]
+        console.print(f"Combining {len(image_files)} image(s) into one request. Generating {variants} variant(s) — {model_desc}")
     else:
+        sources = [[f] for f in image_files]
         console.print(f"Found {len(image_files)} image(s). Generating {variants} variant(s) each — {model_desc}")
 
     with Progress(
@@ -559,13 +580,13 @@ async def async_main(image_files: list[Path], model_keys: list[str], extra_promp
         transient=False,
     ) as progress:
         tasks = []
-        for img_path in sources:
+        for img_paths in sources:
             for model_key in model_keys:
                 model_id = MODEL_MAPPING[model_key]
                 suffix = SUFFIX_MAPPING[model_key]
-                start_idx = _next_variant_index(img_path, suffix)
+                start_idx = _next_variant_index(img_paths, suffix)
                 for i in range(start_idx, start_idx + variants):
-                    tasks.append(generate_variant(img_path, i, semaphore, log_lock, model_key, model_id, suffix, extra_prompt, override_prompt, image_size, aspect_ratio, progress, estimates, transparent=transparent, alpha_mode=alpha_mode))
+                    tasks.append(generate_variant(img_paths, i, semaphore, log_lock, model_key, model_id, suffix, extra_prompt, override_prompt, image_size, aspect_ratio, progress, estimates, transparent=transparent, alpha_mode=alpha_mode))
 
         console.print(f"Firing off {len(tasks)} requests...")
         await asyncio.gather(*tasks)
@@ -594,6 +615,8 @@ def main():
                         help="Generate image with a transparent background (gpt-image-1 only; ignored for Gemini models and gpt-image-2).")
     parser.add_argument("--alpha", action="store_true",
                         help="Alpha-mask mode: generate a grayscale alpha mask for the source image, then compose it with the source RGB into a final RGBA PNG.")
+    parser.add_argument("--combine", action="store_true",
+                        help="Send all input images together in a single API request instead of one request per image.")
     args = parser.parse_args()
 
     model_keys    = {"all": ["pro", "flash", "gptimage2"], "both": ["pro", "gptimage2"]}.get(args.model, [args.model])
@@ -625,6 +648,7 @@ def main():
     alpha_mode = args.alpha
     if alpha_mode and not args.paths:
         console.print("[yellow]Note:[/yellow] --alpha has no effect in prompt-only mode (no source image to composite).")
+    combine = args.combine
 
     all_suffixes  = set(SUFFIX_MAPPING.values())
 
@@ -654,7 +678,7 @@ def main():
             console.print("[yellow]Warning:[/yellow] no source image and no --prompt given — the default redraw prompt will be used as-is.")
 
 
-    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, transparent=transparent, alpha_mode=alpha_mode))
+    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, transparent=transparent, alpha_mode=alpha_mode, combine=combine))
 
 if __name__ == "__main__":
     main()
