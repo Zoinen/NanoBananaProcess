@@ -550,24 +550,22 @@ def _next_variant_index(image_paths: list[Path], suffix: str) -> int:
             max_idx = max(max_idx, int(m.group(1)))
     return max_idx + 1
 
-async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False, alpha_mode: bool = False, combine: bool = False):
+async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False, alpha_mode: bool = False):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     log_lock  = asyncio.Lock()
     estimates = _load_estimates()
 
-    model_desc   = " + ".join(MODEL_MAPPING[k] for k in model_keys)
-    prompt_only  = not image_files
+    model_desc = " + ".join(MODEL_MAPPING[k] for k in model_keys)
 
-    # sources is a list of image-path lists; each entry becomes one request per variant
-    if prompt_only:
+    # All input images go into a single request per variant
+    if not image_files:
         sources = [[]]
         console.print(f"Prompt-only mode. Generating {variants} variant(s) per model — {model_desc}")
-    elif combine:
-        sources = [image_files]
-        console.print(f"Combining {len(image_files)} image(s) into one request. Generating {variants} variant(s) — {model_desc}")
     else:
-        sources = [[f] for f in image_files]
-        console.print(f"Found {len(image_files)} image(s). Generating {variants} variant(s) each — {model_desc}")
+        sources = [image_files]
+        n = len(image_files)
+        label = "1 image" if n == 1 else f"{n} images combined"
+        console.print(f"{label}. Generating {variants} variant(s) — {model_desc}")
 
     with Progress(
         SpinnerColumn(),
@@ -615,8 +613,6 @@ def main():
                         help="Generate image with a transparent background (gpt-image-1 only; ignored for Gemini models and gpt-image-2).")
     parser.add_argument("--alpha", action="store_true",
                         help="Alpha-mask mode: generate a grayscale alpha mask for the source image, then compose it with the source RGB into a final RGBA PNG.")
-    parser.add_argument("--combine", action="store_true",
-                        help="Send all input images together in a single API request instead of one request per image.")
     args = parser.parse_args()
 
     model_keys    = {"all": ["pro", "flash", "gptimage2"], "both": ["pro", "gptimage2"]}.get(args.model, [args.model])
@@ -648,7 +644,6 @@ def main():
     alpha_mode = args.alpha
     if alpha_mode and not args.paths:
         console.print("[yellow]Note:[/yellow] --alpha has no effect in prompt-only mode (no source image to composite).")
-    combine = args.combine
 
     all_suffixes  = set(SUFFIX_MAPPING.values())
 
@@ -678,7 +673,7 @@ def main():
             console.print("[yellow]Warning:[/yellow] no source image and no --prompt given — the default redraw prompt will be used as-is.")
 
 
-    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, transparent=transparent, alpha_mode=alpha_mode, combine=combine))
+    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, transparent=transparent, alpha_mode=alpha_mode))
 
 if __name__ == "__main__":
     main()
