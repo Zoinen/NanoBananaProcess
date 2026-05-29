@@ -654,16 +654,18 @@ def main():
         for raw in args.paths:
             input_path = Path(raw)
             if input_path.is_file():
-                image_files.append(input_path)
+                image_files.append(input_path)  # explicit file — always included
             elif input_path.is_dir():
+                # Directory expansion: skip our own output files
                 image_files.extend(
                     p for p in input_path.iterdir()
-                    if p.is_file() and p.suffix.lower() in valid_exts
+                    if p.is_file()
+                    and p.suffix.lower() in valid_exts
+                    and not any(s in p.stem for s in all_suffixes)
                 )
             else:
                 console.print(f"[red]Invalid path:[/red] {raw}")
                 return
-        image_files = [f for f in image_files if not any(s in f.stem for s in all_suffixes)]
         if not image_files:
             console.print("No valid, unprocessed images found.")
             return
