@@ -394,7 +394,7 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
     elif len(image_paths) == 1:
         base_output = image_paths[0].with_name(f"{image_paths[0].stem}{suffix}{variant_idx}")
     else:
-        base_output = image_paths[0].with_name(f"combined{suffix}{variant_idx}")
+        base_output = image_paths[0].with_name(f"{'+'.join(p.stem for p in image_paths)}{suffix}{variant_idx}")
     output_path = base_output  # will be replaced with the real path after the call
 
     final_prompt = BASE_PROMPT
@@ -538,7 +538,7 @@ def _next_variant_index(image_paths: list[Path], suffix: str) -> int:
     elif len(image_paths) == 1:
         directory, stem = image_paths[0].parent, image_paths[0].stem
     else:
-        directory, stem = image_paths[0].parent, "combined"
+        directory, stem = image_paths[0].parent, "+".join(p.stem for p in image_paths)
     pattern = re.compile(
         rf"^{re.escape(stem)}{re.escape(suffix)}(\d+)\.(png|jpg|jpeg|webp)$",
         re.IGNORECASE,
