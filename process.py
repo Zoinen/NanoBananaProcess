@@ -595,8 +595,8 @@ def main():
     parser = argparse.ArgumentParser(description="Redraw images asynchronously using Gemini Image Models.")
     parser.add_argument("paths", nargs="*", default=[],
                         help="One or more image files or folders. Mix freely. Omit to generate from prompt only.")
-    parser.add_argument("--model", choices=["pro", "flash", "gptimage1", "gptimage2", "both", "all"], default="pro",
-                        help="Choose 'pro' (Nano Banana Pro), 'flash' (Nano Banana 2), 'gptimage1' (GPT Image 1, supports transparency), 'gptimage2' (GPT Image 2), 'both' (pro + gptimage2), or 'all' (pro + flash + gptimage2) in parallel.")
+    parser.add_argument("--model", choices=["pro", "flash", "gptimage1", "gptimage2", "both", "google", "all"], default="pro",
+                        help="Choose 'pro' (Nano Banana Pro), 'flash' (Nano Banana 2), 'gptimage1' (GPT Image 1, supports transparency), 'gptimage2' (GPT Image 2), 'both' (pro + gptimage2), 'google' (pro + flash), or 'all' (pro + flash + gptimage2) in parallel.")
     parser.add_argument("--extra-prompt", type=str, default="",
                         help="Additional text to append to the end of the base prompt.")
     parser.add_argument("--prompt", type=str, default="",
@@ -615,7 +615,7 @@ def main():
                         help="Alpha-mask mode: generate a grayscale alpha mask for the source image, then compose it with the source RGB into a final RGBA PNG.")
     args = parser.parse_args()
 
-    model_keys    = {"all": ["pro", "flash", "gptimage2"], "both": ["pro", "gptimage2"]}.get(args.model, [args.model])
+    model_keys    = {"all": ["pro", "flash", "gptimage2"], "both": ["pro", "gptimage2"], "google": ["pro", "flash"]}.get(args.model, [args.model])
     extra_prompt  = args.extra_prompt
 
     file_prompt = ""
