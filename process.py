@@ -308,8 +308,14 @@ def _compute_openai_size(src_w: int, src_h: int, mode: str = "max", override_rat
 
 
 def _source_to_gemini_size(w: int, h: int) -> str:
-    """Pick the nearest Gemini image-size preset for a given source resolution."""
-    return "1K" if max(w, h) <= 1536 else "4K"
+    """Pick the nearest Gemini image-size preset for a given source resolution.
+
+    Uses total pixel count: the geometric mean of 1K (~1 MP) and 4K (~16 MP)
+    is ~4 MP, so anything below that threshold maps to '1K'.
+    This correctly handles tall/wide images like phone screenshots (e.g.
+    1080x2400 = 2.6 MP → '1K') that would be misclassified by a max-edge check.
+    """
+    return "1K" if w * h <= 4_000_000 else "4K"
 
 # gpt-image-1 supports only these fixed presets (ratio → WxH string)
 _GPT_IMAGE_1_PRESETS = [
