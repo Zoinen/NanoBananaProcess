@@ -111,6 +111,15 @@ async def _compose_alpha_async(source_path: Path, mask_path: Path) -> Path:
 
     return await asyncio.to_thread(_compose)
 
+async def _resize_to_async(target_size: tuple[int, int], image_path: Path) -> Path:
+    """Resize the image at image_path to exactly target_size (W, H) in place."""
+    def _do():
+        img = Image.open(image_path)
+        if img.size != target_size:
+            img.resize(target_size, Image.LANCZOS).save(image_path)
+        return image_path
+    return await asyncio.to_thread(_do)
+
 async def save_image_async(image_obj_or_bytes, output_path: Path):
     """Offloads the file saving to a separate thread so it doesn't block the async event loop."""
     def _save():
@@ -492,13 +501,16 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                 output_path = await _call_openai(imgs, base_output, model_id, final_prompt, resolved_size, quality, transparent=use_transparent)
             else:
                 if image_size == "source":
-                    resolved_size = _source_to_gemini_size(*imgs[0].size) if imgs else "4K"
+                    # Always generate at 4K then downscale — avoids upscaling artefacts
+                    resolved_size = "4K"
                 elif _CUSTOM_SIZE_RE.match(image_size):
                     cw, ch = map(int, image_size.split("x"))
                     resolved_size = _source_to_gemini_size(cw, ch)
                 else:
                     resolved_size = image_size
                 output_path = await _call_google(imgs, base_output, model_id, final_prompt, resolved_size, aspect_ratio)
+                if image_size == "source" and imgs:
+                    output_path = await _resize_to_async(imgs[0].size, output_path)
 
             status = "success"
             progress.print(f"✅ Saved {output_path.name}")
