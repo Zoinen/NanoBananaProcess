@@ -111,15 +111,6 @@ async def _compose_alpha_async(source_path: Path, mask_path: Path) -> Path:
 
     return await asyncio.to_thread(_compose)
 
-async def _resize_to_async(target_size: tuple[int, int], image_path: Path) -> Path:
-    """Resize the image at image_path to exactly target_size (W, H) in place."""
-    def _do():
-        img = Image.open(image_path)
-        if img.size != target_size:
-            img.resize(target_size, Image.LANCZOS).save(image_path)
-        return image_path
-    return await asyncio.to_thread(_do)
-
 async def save_image_async(image_obj_or_bytes, output_path: Path):
     """Offloads the file saving to a separate thread so it doesn't block the async event loop."""
     def _save():
@@ -317,14 +308,19 @@ def _compute_openai_size(src_w: int, src_h: int, mode: str = "max", override_rat
 
 
 def _source_to_gemini_size(w: int, h: int) -> str:
-    """Pick the nearest Gemini image-size preset for a given source resolution.
+    """Pick the nearest Gemini image-size preset (1K/2K/4K) for a given source resolution.
 
-    Uses total pixel count: the geometric mean of 1K (~1 MP) and 4K (~16 MP)
-    is ~4 MP, so anything below that threshold maps to '1K'.
-    This correctly handles tall/wide images like phone screenshots (e.g.
-    1080x2400 = 2.6 MP → '1K') that would be misclassified by a max-edge check.
+    Thresholds are geometric means between adjacent preset pixel counts:
+      1K ≈ 1 MP, 2K ≈ 4 MP, 4K ≈ 16 MP
+      1K↔2K midpoint: sqrt(1×4)  = 2 MP
+      2K↔4K midpoint: sqrt(4×16) = 8 MP
     """
-    return "1K" if w * h <= 4_000_000 else "4K"
+    px = w * h
+    if px <= 2_000_000:
+        return "1K"
+    if px <= 8_000_000:
+        return "2K"
+    return "4K"
 
 # gpt-image-1 supports only these fixed presets (ratio → WxH string)
 _GPT_IMAGE_1_PRESETS = [
@@ -501,16 +497,13 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                 output_path = await _call_openai(imgs, base_output, model_id, final_prompt, resolved_size, quality, transparent=use_transparent)
             else:
                 if image_size == "source":
-                    # Always generate at 4K then downscale — avoids upscaling artefacts
-                    resolved_size = "4K"
+                    resolved_size = _source_to_gemini_size(*imgs[0].size) if imgs else "4K"
                 elif _CUSTOM_SIZE_RE.match(image_size):
                     cw, ch = map(int, image_size.split("x"))
                     resolved_size = _source_to_gemini_size(cw, ch)
                 else:
                     resolved_size = image_size
                 output_path = await _call_google(imgs, base_output, model_id, final_prompt, resolved_size, aspect_ratio)
-                if image_size == "source" and imgs:
-                    output_path = await _resize_to_async(imgs[0].size, output_path)
 
             status = "success"
             progress.print(f"✅ Saved {output_path.name}")
