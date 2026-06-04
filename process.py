@@ -50,7 +50,7 @@ MAX_OPENAI_IMAGE_BYTES  = 50 * 1024 * 1024  # OpenAI hard limit for input images
 MODEL_MAPPING = {
     "pro":       "gemini-3-pro-image-preview",      # Nano Banana Pro
     "flash":     "gemini-3.1-flash-image-preview",  # Nano Banana 2
-    "gptimage1": "gpt-image-1",                     # GPT Image 1 (supports transparency)
+    "gptimage1": "gpt-image-1.5",                   # GPT Image 1.5 (supports transparency; replaces gpt-image-1)
     "gptimage2": "gpt-image-2",                     # GPT Image 2
 }
 
