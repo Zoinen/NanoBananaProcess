@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import math
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,10 @@ from openai import AsyncOpenAI
 # Initialize clients
 google_client = genai.Client()
 openai_client = AsyncOpenAI()
+xai_client = AsyncOpenAI(
+    base_url="https://api.x.ai/v1",
+    api_key=os.environ.get("XAI_API_KEY", "not-set"),
+)
 console  = Console()
 LOG_FILE = Path(__file__).parent / "requests.log"
 
@@ -52,6 +57,7 @@ MODEL_MAPPING = {
     "flash":     "gemini-3.1-flash-image-preview",  # Nano Banana 2
     "gptimage1": "gpt-image-1.5",                   # GPT Image 1.5 (supports transparency; replaces gpt-image-1)
     "gptimage2": "gpt-image-2",                     # GPT Image 2
+    "grok":      "grok-imagine-image-quality",      # xAI Grok Imagine (supports transparency)
 }
 
 SUFFIX_MAPPING = {
@@ -59,6 +65,7 @@ SUFFIX_MAPPING = {
     "flash":     "_nb_two_",     # Nano Banana 2
     "gptimage1": "_gptimg_one_", # GPT Image 1
     "gptimage2": "_gptimg_two_", # GPT Image 2
+    "grok":      "_grok_",       # Grok Imagine
 }
 
 PROVIDER_MAPPING = {
@@ -66,6 +73,7 @@ PROVIDER_MAPPING = {
     "flash":     "google",
     "gptimage1": "openai",
     "gptimage2": "openai",
+    "grok":      "xai",
 }
 
 def _mime_to_ext(mime_type: str) -> str:
@@ -333,8 +341,22 @@ def _pick_gptimage1_size(ratio: float) -> str:
     """Return the gpt-image-1 preset whose aspect ratio is closest to *ratio*."""
     return min(_GPT_IMAGE_1_PRESETS, key=lambda p: abs(math.log(ratio / p[0])))[1]
 
-async def _call_openai(imgs: list[Image.Image], base_output: Path, model_id: str, prompt: str, size: str, quality: str, transparent: bool = False) -> Path:
-    """Calls the OpenAI API and saves the result. Returns the actual saved path."""
+# grok-imagine-image-quality supports these aspect ratios natively
+_GROK_ASPECT_RATIOS = [
+    "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
+    "2:1", "1:2", "19.5:9", "9:19.5", "20:9", "9:20",
+]
+
+def _pick_grok_aspect_ratio(ratio: float) -> str:
+    """Return the nearest grok-supported aspect ratio string for a given w/h ratio."""
+    def _to_float(ar: str) -> float:
+        w, h = ar.split(":")
+        return float(w) / float(h)
+    return min(_GROK_ASPECT_RATIOS, key=lambda ar: abs(math.log(ratio / _to_float(ar))))
+
+async def _call_openai(imgs: list[Image.Image], base_output: Path, model_id: str, prompt: str, size: str, quality: str | None, transparent: bool = False, client: AsyncOpenAI | None = None, extra_body: dict | None = None) -> Path:
+    """Calls an OpenAI-compatible image API and saves the result. Returns the actual saved path."""
+    _client = client or openai_client
     extra = {}
     if transparent:
         extra["background"] = "transparent"
@@ -363,25 +385,21 @@ async def _call_openai(imgs: list[Image.Image], base_output: Path, model_id: str
             return bufs
 
         bufs = await asyncio.to_thread(_to_bufs)
-        response = await openai_client.images.edit(
-            model=model_id,
-            image=bufs[0] if len(bufs) == 1 else bufs,
-            prompt=prompt,
-            size=size,
-            quality=quality,
-            n=1,
-            **extra,
-        )
+        call_kwargs = dict(model=model_id, image=bufs[0] if len(bufs) == 1 else bufs,
+                           prompt=prompt, size=size, n=1, **extra)
+        if quality is not None:
+            call_kwargs["quality"] = quality
+        if extra_body:
+            call_kwargs["extra_body"] = extra_body
+        response = await _client.images.edit(**call_kwargs)
     else:
         # Generate mode: pure prompt, no source image
-        response = await openai_client.images.generate(
-            model=model_id,
-            prompt=prompt,
-            size=size,
-            quality=quality,
-            n=1,
-            **extra,
-        )
+        call_kwargs = dict(model=model_id, prompt=prompt, size=size, n=1, **extra)
+        if quality is not None:
+            call_kwargs["quality"] = quality
+        if extra_body:
+            call_kwargs["extra_body"] = extra_body
+        response = await _client.images.generate(**call_kwargs)
 
     img_bytes = base64.b64decode(response.data[0].b64_json)
     ext = _bytes_to_ext(img_bytes)
@@ -463,7 +481,7 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                     return loaded
                 imgs = await asyncio.to_thread(_load_imgs)
 
-            if PROVIDER_MAPPING[model_key] == "openai":
+            if PROVIDER_MAPPING[model_key] != "google":
                 override_ratio = _parse_aspect_ratio(aspect_ratio) if aspect_ratio else None
                 src_dims = imgs[0].size if imgs else (1, 1)
                 raw_ratio = override_ratio if override_ratio is not None else (src_dims[0] / src_dims[1])
@@ -478,6 +496,20 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                     else:
                         resolved_size, quality = _pick_gptimage1_size(raw_ratio), "high"
                     use_transparent = transparent
+                    call_client, call_extra_body = None, None
+                elif model_key == "grok":
+                    # grok: "1k"/"2k" size strings; aspect ratio as separate param; transparency supported
+                    if image_size == "1K":
+                        resolved_size = "1k"
+                    elif image_size == "source" and imgs:
+                        resolved_size = "1k" if src_dims[0] * src_dims[1] <= 2_000_000 else "2k"
+                    else:
+                        resolved_size = "2k"
+                    quality = None  # grok has no quality tiers
+                    use_transparent = transparent
+                    target_ratio = override_ratio if override_ratio is not None else (raw_ratio if imgs else None)
+                    grok_ar = _pick_grok_aspect_ratio(target_ratio) if target_ratio is not None else "auto"
+                    call_client, call_extra_body = xai_client, {"aspect_ratio": grok_ar}
                 else:
                     # gpt-image-2: arbitrary WxH; transparency NOT supported
                     if image_size == "1K":
@@ -493,8 +525,9 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                     else:
                         resolved_size, quality = _compute_openai_size(*src_dims, override_ratio=override_ratio), "high"
                     use_transparent = False  # gpt-image-2 rejects background=transparent
+                    call_client, call_extra_body = None, None
 
-                output_path = await _call_openai(imgs, base_output, model_id, final_prompt, resolved_size, quality, transparent=use_transparent)
+                output_path = await _call_openai(imgs, base_output, model_id, final_prompt, resolved_size, quality, transparent=use_transparent, client=call_client, extra_body=call_extra_body)
             else:
                 if image_size == "source":
                     resolved_size = _source_to_gemini_size(*imgs[0].size) if imgs else "4K"
@@ -606,8 +639,8 @@ def main():
     parser = argparse.ArgumentParser(description="Redraw images asynchronously using Gemini Image Models.")
     parser.add_argument("paths", nargs="*", default=[],
                         help="One or more image files or folders. Mix freely. Omit to generate from prompt only.")
-    parser.add_argument("--model", choices=["pro", "flash", "gptimage1", "gptimage2", "both", "google", "all"], default="pro",
-                        help="Choose 'pro' (Nano Banana Pro), 'flash' (Nano Banana 2), 'gptimage1' (GPT Image 1, supports transparency), 'gptimage2' (GPT Image 2), 'both' (pro + gptimage2), 'google' (pro + flash), or 'all' (pro + flash + gptimage2) in parallel.")
+    parser.add_argument("--model", choices=["pro", "flash", "gptimage1", "gptimage2", "grok", "both", "google", "all"], default="pro",
+                        help="Choose 'pro' (Nano Banana Pro), 'flash' (Nano Banana 2), 'gptimage1' (GPT Image 1, supports transparency), 'gptimage2' (GPT Image 2), 'grok' (Grok Imagine, supports transparency), 'both' (pro + gptimage2), 'google' (pro + flash), or 'all' (pro + flash + gptimage2) in parallel.")
     parser.add_argument("--extra-prompt", type=str, default="",
                         help="Additional text to append to the end of the base prompt.")
     parser.add_argument("--prompt", type=str, default="",
@@ -648,9 +681,9 @@ def main():
     transparent   = args.transparent
 
     if transparent:
-        unsupported = [k for k in model_keys if k != "gptimage1"]
+        unsupported = [k for k in model_keys if k not in ("gptimage1", "grok")]
         if unsupported:
-            console.print(f"[yellow]Note:[/yellow] --transparent is only supported by gpt-image-1 and will be ignored for: {', '.join(unsupported)}")
+            console.print(f"[yellow]Note:[/yellow] --transparent is only supported by gpt-image-1 and grok; will be ignored for: {', '.join(unsupported)}")
 
     alpha_mode = args.alpha
     if alpha_mode and not args.paths:
