@@ -224,7 +224,7 @@ def convert_image(
     suffix = destination.suffix.lower()
 
     if suffix == ".png":
-        output_spec = f"PNG32:{destination}"
+        output_spec = f"PNG:{destination}"
     elif suffix in {".jpg", ".jpeg"}:
         output_spec = f"JPEG:{destination}"
     elif suffix == ".webp":
