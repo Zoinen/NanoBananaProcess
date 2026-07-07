@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import sys
 import base64
 import io
 import json
@@ -15,14 +16,19 @@ from google import genai
 from google.genai import types
 from openai import AsyncOpenAI
 
-# Initialize clients
-google_client = genai.Client()
-openai_client = AsyncOpenAI()
-xai_client = AsyncOpenAI(
-    base_url="https://api.x.ai/v1",
-    api_key=os.environ.get("XAI_API_KEY", "not-set"),
-)
-console  = Console()
+console = Console()
+google_client = None
+openai_client = None
+xai_client = None
+
+def _init_clients():
+    global google_client, openai_client, xai_client
+    google_client = genai.Client()
+    openai_client = AsyncOpenAI()
+    xai_client = AsyncOpenAI(
+        base_url="https://api.x.ai/v1",
+        api_key=os.environ.get("XAI_API_KEY", "not-set"),
+    )
 LOG_FILE = Path(__file__).parent / "requests.log"
 
 def _load_estimates() -> dict:
@@ -150,13 +156,13 @@ async def _call_google(imgs: list[Image.Image], base_output: Path, model_id: str
     for part in response.parts:
         if part.inline_data:
             ext = _mime_to_ext(part.inline_data.mime_type)
-            output_path = Path(str(base_output) + ext)
+            output_path = base_output.parent / (base_output.name + ext)
             await save_image_async(part.inline_data.data, output_path)
             return output_path
         if hasattr(part, 'as_image') and callable(part.as_image):
             pil_img = part.as_image()
             ext = _pil_format_to_ext(pil_img.format)
-            output_path = Path(str(base_output) + ext)
+            output_path = base_output.parent / (base_output.name + ext)
             await save_image_async(pil_img, output_path)
             return output_path
 
@@ -406,7 +412,7 @@ async def _call_openai(imgs: list[Image.Image], base_output: Path, model_id: str
 
     img_bytes = base64.b64decode(response.data[0].b64_json)
     ext = _bytes_to_ext(img_bytes)
-    output_path = Path(str(base_output) + ext)
+    output_path = base_output.parent / (base_output.name + ext)
     await save_image_async(img_bytes, output_path)
     return output_path
 
@@ -460,7 +466,7 @@ async def _call_xai(imgs: list[Image.Image], base_output: Path, model_id: str, p
         raise RuntimeError(f"No image data in xAI response: {data}")
 
     ext = _bytes_to_ext(img_bytes)
-    output_path = Path(str(base_output) + ext)
+    output_path = base_output.parent / (base_output.name + ext)
     await save_image_async(img_bytes, output_path)
     return output_path
 
@@ -710,7 +716,11 @@ def main():
                         help="Generate image with a transparent background (gpt-image-1 only; ignored for Gemini models and gpt-image-2).")
     parser.add_argument("--alpha", action="store_true",
                         help="Alpha-mask mode: generate a grayscale alpha mask for the source image, then compose it with the source RGB into a final RGBA PNG.")
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return
     args = parser.parse_args()
+    _init_clients()
 
     model_keys    = {"all": ["pro", "flash", "gptimage2"], "both": ["pro", "gptimage2"], "google": ["pro", "flash"]}.get(args.model, [args.model])
     extra_prompt  = args.extra_prompt
