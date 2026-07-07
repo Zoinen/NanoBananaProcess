@@ -55,6 +55,7 @@ MAX_OPENAI_IMAGE_BYTES  = 50 * 1024 * 1024  # OpenAI hard limit for input images
 MODEL_MAPPING = {
     "pro":       "gemini-3-pro-image-preview",      # Nano Banana Pro
     "flash":     "gemini-3.1-flash-image-preview",  # Nano Banana 2
+    "lite":      "gemini-3.1-flash-lite-image",     # Nano Banana 2 Lite (fast, cheap)
     "gptimage1": "gpt-image-1.5",                   # GPT Image 1.5 (supports transparency; replaces gpt-image-1)
     "gptimage2": "gpt-image-2",                     # GPT Image 2
     "grok":      "grok-imagine-image-quality",      # xAI Grok Imagine (supports transparency)
@@ -63,6 +64,7 @@ MODEL_MAPPING = {
 SUFFIX_MAPPING = {
     "pro":       "_nb_pro_",     # Nano Banana Pro
     "flash":     "_nb_two_",     # Nano Banana 2
+    "lite":      "_nb_lite_",    # Nano Banana 2 Lite
     "gptimage1": "_gptimg_one_", # GPT Image 1
     "gptimage2": "_gptimg_two_", # GPT Image 2
     "grok":      "_grok_",       # Grok Imagine
@@ -71,6 +73,7 @@ SUFFIX_MAPPING = {
 PROVIDER_MAPPING = {
     "pro":       "google",
     "flash":     "google",
+    "lite":      "google",
     "gptimage1": "openai",
     "gptimage2": "openai",
     "grok":      "xai",
@@ -147,13 +150,13 @@ async def _call_google(imgs: list[Image.Image], base_output: Path, model_id: str
     for part in response.parts:
         if part.inline_data:
             ext = _mime_to_ext(part.inline_data.mime_type)
-            output_path = base_output.with_suffix(ext)
+            output_path = Path(str(base_output) + ext)
             await save_image_async(part.inline_data.data, output_path)
             return output_path
         if hasattr(part, 'as_image') and callable(part.as_image):
             pil_img = part.as_image()
             ext = _pil_format_to_ext(pil_img.format)
-            output_path = base_output.with_suffix(ext)
+            output_path = Path(str(base_output) + ext)
             await save_image_async(pil_img, output_path)
             return output_path
 
@@ -403,7 +406,61 @@ async def _call_openai(imgs: list[Image.Image], base_output: Path, model_id: str
 
     img_bytes = base64.b64decode(response.data[0].b64_json)
     ext = _bytes_to_ext(img_bytes)
-    output_path = base_output.with_suffix(ext)
+    output_path = Path(str(base_output) + ext)
+    await save_image_async(img_bytes, output_path)
+    return output_path
+
+async def _call_xai(imgs: list[Image.Image], base_output: Path, model_id: str, prompt: str, size: str, transparent: bool = False, aspect_ratio: str = "auto") -> Path:
+    """Calls xAI image API via raw JSON POST (multipart not supported by xAI). Returns the saved path."""
+    import httpx
+
+    api_key = os.environ.get("XAI_API_KEY", "not-set")
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+    if imgs:
+        def _to_b64s():
+            result = []
+            for img in imgs:
+                work = img
+                buf = io.BytesIO()
+                work.save(buf, format="PNG")
+                while buf.tell() > MAX_OPENAI_IMAGE_BYTES:
+                    scale = math.sqrt(MAX_OPENAI_IMAGE_BYTES / buf.tell()) * 0.92
+                    work = work.resize(
+                        (max(1, int(work.width * scale)), max(1, int(work.height * scale))),
+                        Image.LANCZOS,
+                    )
+                    buf = io.BytesIO()
+                    work.save(buf, format="PNG")
+                result.append("data:image/png;base64," + base64.b64encode(buf.getvalue()).decode())
+            return result
+
+        b64s = await asyncio.to_thread(_to_b64s)
+        img_objs = [{"url": b, "type": "image_url"} for b in b64s]
+        body = {"model": model_id, "prompt": prompt, "resolution": size, "aspect_ratio": aspect_ratio, "n": 1,
+                "image": img_objs[0] if len(img_objs) == 1 else img_objs}
+        url = "https://api.x.ai/v1/images/edits"
+    else:
+        body = {"model": model_id, "prompt": prompt, "resolution": size, "aspect_ratio": aspect_ratio, "n": 1}
+        url = "https://api.x.ai/v1/images/generations"
+
+    async with httpx.AsyncClient(timeout=300.0) as http:
+        resp = await http.post(url, json=body, headers=headers)
+        if not resp.is_success:
+            raise RuntimeError(f"xAI {resp.status_code}: {resp.text}")
+        data = resp.json()
+
+    item = data["data"][0]
+    if item.get("b64_json"):
+        img_bytes = base64.b64decode(item["b64_json"])
+    elif item.get("url"):
+        async with httpx.AsyncClient(timeout=60.0) as http:
+            img_bytes = (await http.get(item["url"])).content
+    else:
+        raise RuntimeError(f"No image data in xAI response: {data}")
+
+    ext = _bytes_to_ext(img_bytes)
+    output_path = Path(str(base_output) + ext)
     await save_image_async(img_bytes, output_path)
     return output_path
 
@@ -495,8 +552,7 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                         resolved_size, quality = _pick_gptimage1_size(override_ratio or (cw / ch)), "high"
                     else:
                         resolved_size, quality = _pick_gptimage1_size(raw_ratio), "high"
-                    use_transparent = transparent
-                    call_client, call_extra_body = None, None
+                    output_path = await _call_openai(imgs, base_output, model_id, final_prompt, resolved_size, quality, transparent=transparent)
                 elif model_key == "grok":
                     # grok: "1k"/"2k" size strings; aspect ratio as separate param; transparency supported
                     if image_size == "1K":
@@ -505,11 +561,10 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                         resolved_size = "1k" if src_dims[0] * src_dims[1] <= 2_000_000 else "2k"
                     else:
                         resolved_size = "2k"
-                    quality = None  # grok has no quality tiers
-                    use_transparent = transparent
+                    quality = None
                     target_ratio = override_ratio if override_ratio is not None else (raw_ratio if imgs else None)
                     grok_ar = _pick_grok_aspect_ratio(target_ratio) if target_ratio is not None else "auto"
-                    call_client, call_extra_body = xai_client, {"aspect_ratio": grok_ar}
+                    output_path = await _call_xai(imgs, base_output, model_id, final_prompt, resolved_size, transparent, grok_ar)
                 else:
                     # gpt-image-2: arbitrary WxH; transparency NOT supported
                     if image_size == "1K":
@@ -520,20 +575,18 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                         cw, ch = map(int, image_size.split("x"))
                         resolved_size, quality = _compute_openai_size(cw, ch, mode="source", override_ratio=override_ratio), "high"
                     elif not imgs and override_ratio is None:
-                        # No source image and no ratio hint: let the API choose
                         resolved_size, quality = "auto", "high"
                     else:
                         resolved_size, quality = _compute_openai_size(*src_dims, override_ratio=override_ratio), "high"
-                    use_transparent = False  # gpt-image-2 rejects background=transparent
-                    call_client, call_extra_body = None, None
-
-                output_path = await _call_openai(imgs, base_output, model_id, final_prompt, resolved_size, quality, transparent=use_transparent, client=call_client, extra_body=call_extra_body)
+                    output_path = await _call_openai(imgs, base_output, model_id, final_prompt, resolved_size, quality, transparent=False)
             else:
                 if image_size == "source":
                     resolved_size = _source_to_gemini_size(*imgs[0].size) if imgs else "4K"
                 elif _CUSTOM_SIZE_RE.match(image_size):
                     cw, ch = map(int, image_size.split("x"))
                     resolved_size = _source_to_gemini_size(cw, ch)
+                    if aspect_ratio is None:
+                        aspect_ratio = _pick_grok_aspect_ratio(cw / ch)
                 else:
                     resolved_size = image_size
                 output_path = await _call_google(imgs, base_output, model_id, final_prompt, resolved_size, aspect_ratio)
@@ -639,8 +692,8 @@ def main():
     parser = argparse.ArgumentParser(description="Redraw images asynchronously using Gemini Image Models.")
     parser.add_argument("paths", nargs="*", default=[],
                         help="One or more image files or folders. Mix freely. Omit to generate from prompt only.")
-    parser.add_argument("--model", choices=["pro", "flash", "gptimage1", "gptimage2", "grok", "both", "google", "all"], default="pro",
-                        help="Choose 'pro' (Nano Banana Pro), 'flash' (Nano Banana 2), 'gptimage1' (GPT Image 1, supports transparency), 'gptimage2' (GPT Image 2), 'grok' (Grok Imagine, supports transparency), 'both' (pro + gptimage2), 'google' (pro + flash), or 'all' (pro + flash + gptimage2) in parallel.")
+    parser.add_argument("--model", choices=["pro", "flash", "lite", "gptimage1", "gptimage2", "grok", "both", "google", "all"], default="pro",
+                        help="Choose 'pro' (Nano Banana Pro), 'flash' (Nano Banana 2), 'lite' (Nano Banana 2 Lite, fast+cheap), 'gptimage1' (GPT Image 1, supports transparency), 'gptimage2' (GPT Image 2), 'grok' (Grok Imagine, JPEG output only, no transparency), 'both' (pro + gptimage2), 'google' (pro + flash), or 'all' (pro + flash + gptimage2) in parallel.")
     parser.add_argument("--extra-prompt", type=str, default="",
                         help="Additional text to append to the end of the base prompt.")
     parser.add_argument("--prompt", type=str, default="",
@@ -681,9 +734,9 @@ def main():
     transparent   = args.transparent
 
     if transparent:
-        unsupported = [k for k in model_keys if k not in ("gptimage1", "grok")]
+        unsupported = [k for k in model_keys if k not in ("gptimage1",)]
         if unsupported:
-            console.print(f"[yellow]Note:[/yellow] --transparent is only supported by gpt-image-1 and grok; will be ignored for: {', '.join(unsupported)}")
+            console.print(f"[yellow]Note:[/yellow] --transparent is only supported by gpt-image-1; will be ignored for: {', '.join(unsupported)}")
 
     alpha_mode = args.alpha
     if alpha_mode and not args.paths:
