@@ -344,6 +344,13 @@ def _pick_gptimage1_size(ratio: float) -> str:
     """Return the gpt-image-1 preset whose aspect ratio is closest to *ratio*."""
     return min(_GPT_IMAGE_1_PRESETS, key=lambda p: abs(math.log(ratio / p[0])))[1]
 
+def _pick_nearest_aspect_ratio(ratio: float, choices: list[str]) -> str:
+    """Return the choice string whose w/h ratio is closest (log-scale) to *ratio*."""
+    def _to_float(ar: str) -> float:
+        w, h = ar.split(":")
+        return float(w) / float(h)
+    return min(choices, key=lambda ar: abs(math.log(ratio / _to_float(ar))))
+
 # grok-imagine-image-quality supports these aspect ratios natively
 _GROK_ASPECT_RATIOS = [
     "1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3",
@@ -352,10 +359,17 @@ _GROK_ASPECT_RATIOS = [
 
 def _pick_grok_aspect_ratio(ratio: float) -> str:
     """Return the nearest grok-supported aspect ratio string for a given w/h ratio."""
-    def _to_float(ar: str) -> float:
-        w, h = ar.split(":")
-        return float(w) / float(h)
-    return min(_GROK_ASPECT_RATIOS, key=lambda ar: abs(math.log(ratio / _to_float(ar))))
+    return _pick_nearest_aspect_ratio(ratio, _GROK_ASPECT_RATIOS)
+
+# Gemini image models support these aspect ratios natively
+_GEMINI_ASPECT_RATIOS = [
+    "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1",
+    "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9",
+]
+
+def _pick_gemini_aspect_ratio(ratio: float) -> str:
+    """Return the nearest Gemini-supported aspect ratio string for a given w/h ratio."""
+    return _pick_nearest_aspect_ratio(ratio, _GEMINI_ASPECT_RATIOS)
 
 async def _call_openai(imgs: list[Image.Image], base_output: Path, model_id: str, prompt: str, size: str, quality: str | None, transparent: bool = False, client: AsyncOpenAI | None = None, extra_body: dict | None = None) -> Path:
     """Calls an OpenAI-compatible image API and saves the result. Returns the actual saved path."""
@@ -586,10 +600,11 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                     cw, ch = map(int, image_size.split("x"))
                     resolved_size = _source_to_gemini_size(cw, ch)
                     if aspect_ratio is None:
-                        aspect_ratio = _pick_grok_aspect_ratio(cw / ch)
+                        aspect_ratio = f"{cw}:{ch}"
                 else:
                     resolved_size = image_size
-                output_path = await _call_google(imgs, base_output, model_id, final_prompt, resolved_size, aspect_ratio)
+                gemini_ar = _pick_gemini_aspect_ratio(_parse_aspect_ratio(aspect_ratio)) if aspect_ratio else None
+                output_path = await _call_google(imgs, base_output, model_id, final_prompt, resolved_size, gemini_ar)
 
             status = "success"
             progress.print(f"✅ Saved {output_path.name}")
