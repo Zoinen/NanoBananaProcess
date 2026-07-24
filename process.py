@@ -7,6 +7,7 @@ import json
 import math
 import os
 import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image
@@ -377,6 +378,40 @@ def _pick_gemini_aspect_ratio(ratio: float) -> str:
     """Return the nearest Gemini-supported aspect ratio string for a given w/h ratio."""
     return _pick_nearest_aspect_ratio(ratio, _GEMINI_ASPECT_RATIOS)
 
+def _build_prompt(extra_prompt: str, override_prompt: str, alpha_mode: bool) -> str:
+    """Assemble the final prompt from base/override/extra/alpha settings."""
+    final_prompt = BASE_PROMPT
+    if extra_prompt:
+        final_prompt = f"{BASE_PROMPT}. {extra_prompt.strip()}"
+
+    # --prompt fully replaces the base prompt when provided
+    if override_prompt:
+        final_prompt = override_prompt.strip()
+
+    # --alpha always wins — it replaces every other prompt setting, but still
+    # allows --extra-prompt to append additional instructions
+    if alpha_mode:
+        final_prompt = ALPHA_PROMPT
+        if extra_prompt:
+            final_prompt = f"{ALPHA_PROMPT}. {extra_prompt.strip()}"
+
+    return final_prompt
+
+def _resolve_google_size_and_ratio(imgs: list[Image.Image], image_size: str, aspect_ratio: str | None) -> tuple[str, str | None]:
+    """Return (resolved_size, gemini_aspect_ratio) for a Gemini image call."""
+    local_ar = aspect_ratio
+    if image_size == "source":
+        resolved_size = _source_to_gemini_size(*imgs[0].size) if imgs else "4K"
+    elif _CUSTOM_SIZE_RE.match(image_size):
+        cw, ch = map(int, image_size.split("x"))
+        resolved_size = _source_to_gemini_size(cw, ch)
+        if local_ar is None:
+            local_ar = f"{cw}:{ch}"
+    else:
+        resolved_size = image_size
+    gemini_ar = _pick_gemini_aspect_ratio(_parse_aspect_ratio(local_ar)) if local_ar else None
+    return resolved_size, gemini_ar
+
 async def _call_openai(imgs: list[Image.Image], base_output: Path, model_id: str, prompt: str, size: str, quality: str | None, transparent: bool = False, client: AsyncOpenAI | None = None, extra_body: dict | None = None) -> Path:
     """Calls an OpenAI-compatible image API and saves the result. Returns the actual saved path."""
     _client = client or openai_client
@@ -503,20 +538,7 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
         base_output = image_paths[0].with_name(f"{'+'.join(p.stem for p in image_paths)}{suffix}{variant_idx}")
     output_path = base_output  # will be replaced with the real path after the call
 
-    final_prompt = BASE_PROMPT
-    if extra_prompt:
-        final_prompt = f"{BASE_PROMPT}. {extra_prompt.strip()}"
-
-    # --prompt fully replaces the base prompt when provided
-    if override_prompt:
-        final_prompt = override_prompt.strip()
-
-    # --alpha always wins — it replaces every other prompt setting, but still
-    # allows --extra-prompt to append additional instructions
-    if alpha_mode:
-        final_prompt = ALPHA_PROMPT
-        if extra_prompt:
-            final_prompt = f"{ALPHA_PROMPT}. {extra_prompt.strip()}"
+    final_prompt = _build_prompt(extra_prompt, override_prompt, alpha_mode)
 
     async with semaphore:
         estimated = estimates.get((model_key, image_size))
@@ -600,16 +622,7 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                         resolved_size, quality = _compute_openai_size(*src_dims, override_ratio=override_ratio), "high"
                     output_path = await _call_openai(imgs, base_output, model_id, final_prompt, resolved_size, quality, transparent=False)
             else:
-                if image_size == "source":
-                    resolved_size = _source_to_gemini_size(*imgs[0].size) if imgs else "4K"
-                elif _CUSTOM_SIZE_RE.match(image_size):
-                    cw, ch = map(int, image_size.split("x"))
-                    resolved_size = _source_to_gemini_size(cw, ch)
-                    if aspect_ratio is None:
-                        aspect_ratio = f"{cw}:{ch}"
-                else:
-                    resolved_size = image_size
-                gemini_ar = _pick_gemini_aspect_ratio(_parse_aspect_ratio(aspect_ratio)) if aspect_ratio else None
+                resolved_size, gemini_ar = _resolve_google_size_and_ratio(imgs, image_size, aspect_ratio)
                 output_path = await _call_google(imgs, base_output, model_id, final_prompt, resolved_size, gemini_ar)
 
             status = "success"
@@ -667,6 +680,156 @@ def _next_variant_index(image_paths: list[Path], suffix: str) -> int:
         if m:
             max_idx = max(max_idx, int(m.group(1)))
     return max_idx + 1
+
+def _collect_images_from_dir(directory: Path, all_suffixes: set[str], valid_exts: set[str]) -> list[Path]:
+    """List image files in *directory*, skipping our own previously-generated outputs."""
+    return [
+        p for p in directory.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in valid_exts
+        and not any(s in p.stem for s in all_suffixes)
+    ]
+
+_BATCH_POLL_INTERVAL_SECONDS = 30
+_BATCH_TERMINAL_STATES = {
+    "JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED", "JOB_STATE_EXPIRED",
+}
+
+def _image_to_inline_part(img: Image.Image) -> dict:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(buf.getvalue()).decode("ascii")}}
+
+async def _submit_google_batch_job(model_key: str, model_id: str, suffix: str, image_files: list[Path], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, alpha_mode: bool, progress: Progress):
+    """Build, submit, poll, and save results for one model's Gemini Batch API job."""
+    task_id = progress.add_task(f"[dim]{model_key}[/dim]  preparing batch…", total=None)
+
+    def _load_img(p: Path) -> Image.Image:
+        img = Image.open(p)
+        img.load()
+        return img
+
+    requests_by_key: dict[str, dict] = {}
+    meta_by_key: dict[str, dict] = {}
+    final_prompt = _build_prompt(extra_prompt, override_prompt, alpha_mode)
+
+    for image_path in image_files:
+        img = await asyncio.to_thread(_load_img, image_path)
+        resolved_size, gemini_ar = _resolve_google_size_and_ratio([img], image_size, aspect_ratio)
+        base_output = image_path.with_name(f"{image_path.stem}{suffix}")
+        start_idx = _next_variant_index([image_path], suffix)
+
+        image_config = {"image_size": resolved_size}
+        if gemini_ar:
+            image_config["aspect_ratio"] = gemini_ar
+
+        for i in range(start_idx, start_idx + variants):
+            key = uuid.uuid4().hex
+            requests_by_key[key] = {
+                "contents": [{
+                    "role": "user",
+                    "parts": [_image_to_inline_part(img), {"text": final_prompt}],
+                }],
+                "generation_config": {
+                    "response_modalities": ["IMAGE"],
+                    "image_config": image_config,
+                },
+            }
+            meta_by_key[key] = {
+                "image_path": image_path,
+                "variant_idx": i,
+                "base_output": base_output.with_name(f"{base_output.name}{i}"),
+            }
+
+    jsonl_path = LOG_FILE.parent / f"batch_{model_key}_{uuid.uuid4().hex[:8]}.jsonl"
+
+    def _write_jsonl():
+        with open(jsonl_path, "w", encoding="utf-8") as f:
+            for key, req in requests_by_key.items():
+                f.write(json.dumps({"key": key, "request": req}, ensure_ascii=False) + "\n")
+    await asyncio.to_thread(_write_jsonl)
+
+    progress.update(task_id, description=f"[dim]{model_key}[/dim]  uploading {len(requests_by_key)} request(s)…")
+    uploaded = await asyncio.to_thread(
+        google_client.files.upload,
+        file=str(jsonl_path),
+        config=types.UploadFileConfig(display_name=jsonl_path.stem, mime_type="jsonl"),
+    )
+
+    batch_job = await asyncio.to_thread(
+        google_client.batches.create,
+        model=model_id,
+        src=uploaded.name,
+        config={"display_name": f"process-py-{model_key}-{uuid.uuid4().hex[:8]}"},
+    )
+    progress.update(task_id, description=f"[dim]{model_key}[/dim]  job {batch_job.name.split('/')[-1]}: {batch_job.state.name}")
+
+    while batch_job.state.name not in _BATCH_TERMINAL_STATES:
+        await asyncio.sleep(_BATCH_POLL_INTERVAL_SECONDS)
+        batch_job = await asyncio.to_thread(google_client.batches.get, name=batch_job.name)
+        progress.update(task_id, description=f"[dim]{model_key}[/dim]  job {batch_job.name.split('/')[-1]}: {batch_job.state.name}")
+
+    if batch_job.state.name != "JOB_STATE_SUCCEEDED":
+        progress.remove_task(task_id)
+        console.print(f"❌ [red]{model_key} batch job {batch_job.state.name}[/red]: {getattr(batch_job, 'error', None)}")
+        return
+
+    result_file_name = batch_job.dest.file_name
+    content = await asyncio.to_thread(google_client.files.download, file=result_file_name)
+    progress.remove_task(task_id)
+
+    saved, failed = 0, 0
+    for line in content.decode("utf-8").splitlines():
+        if not line.strip():
+            continue
+        result = json.loads(line)
+        key = result.get("key")
+        meta = meta_by_key.get(key)
+        if meta is None:
+            continue
+
+        if "response" in result:
+            try:
+                parts = result["response"]["candidates"][0]["content"]["parts"]
+                inline = next(p.get("inline_data") or p.get("inlineData") for p in parts if p.get("inline_data") or p.get("inlineData"))
+                img_bytes = base64.b64decode(inline["data"])
+                ext = _mime_to_ext(inline.get("mime_type") or inline.get("mimeType") or "")
+                output_path = meta["base_output"].parent / (meta["base_output"].name + ext)
+                await save_image_async(img_bytes, output_path)
+                console.print(f"✅ Saved {output_path.name}")
+                saved += 1
+                if alpha_mode:
+                    composed_path = await _compose_alpha_async(meta["image_path"], output_path)
+                    await asyncio.to_thread(output_path.unlink)
+                    console.print(f"🔀 Composed {composed_path.name}")
+            except (KeyError, IndexError, StopIteration) as e:
+                failed += 1
+                console.print(f"❌ Error: {meta['image_path'].name} variant {meta['variant_idx']}: no image in response ({e})")
+        else:
+            failed += 1
+            console.print(f"❌ Error: {meta['image_path'].name} variant {meta['variant_idx']}: {result.get('error')}")
+
+    console.print(f"[dim]{model_key}[/dim] batch done — {saved} saved, {failed} failed.")
+
+async def run_google_batch(model_keys: list[str], image_files: list[Path], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, alpha_mode: bool = False):
+    n = len(image_files)
+    console.print(f"Batch mode: {n} image(s) × {variants} variant(s) — {' + '.join(MODEL_MAPPING[k] for k in model_keys)}")
+    console.print("[dim]Submitting to the Gemini Batch API (50% cheaper, may take minutes to hours to complete)...[/dim]")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        await asyncio.gather(*[
+            _submit_google_batch_job(model_key, MODEL_MAPPING[model_key], SUFFIX_MAPPING[model_key], image_files,
+                                      extra_prompt, override_prompt, variants, image_size, aspect_ratio, alpha_mode, progress)
+            for model_key in model_keys
+        ])
+
+    console.print("🎉 All batch jobs done!")
 
 async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False, alpha_mode: bool = False):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -731,6 +894,8 @@ def main():
                         help="Generate image with a transparent background (gpt-image-1 only; ignored for Gemini models and gpt-image-2).")
     parser.add_argument("--alpha", action="store_true",
                         help="Alpha-mask mode: generate a grayscale alpha mask for the source image, then compose it with the source RGB into a final RGBA PNG.")
+    parser.add_argument("--batch", type=str, default=None, metavar="FOLDER",
+                        help="Batch mode: process every image in FOLDER via the Gemini Batch API (50%% cheaper, async — can take minutes to hours). Google models only (pro/flash/lite). Do not pass positional paths when using --batch.")
     if len(sys.argv) == 1:
         parser.print_help()
         return
@@ -768,9 +933,28 @@ def main():
         console.print("[yellow]Note:[/yellow] --alpha has no effect in prompt-only mode (no source image to composite).")
 
     all_suffixes  = set(SUFFIX_MAPPING.values())
+    valid_exts    = {".jpg", ".jpeg", ".png", ".webp"}
+
+    if args.batch:
+        if args.paths:
+            console.print("[red]--batch cannot be combined with positional paths[/red] — pass only the folder via --batch.")
+            return
+        unsupported = [k for k in model_keys if k not in ("pro", "flash", "lite")]
+        if unsupported:
+            console.print(f"[red]--batch only supports Google models (pro/flash/lite)[/red] — unsupported: {', '.join(unsupported)}")
+            return
+        batch_dir = Path(args.batch)
+        if not batch_dir.is_dir():
+            console.print(f"[red]--batch folder not found:[/red] {args.batch}")
+            return
+        image_files = _collect_images_from_dir(batch_dir, all_suffixes, valid_exts)
+        if not image_files:
+            console.print("No valid, unprocessed images found in the batch folder.")
+            return
+        asyncio.run(run_google_batch(model_keys, image_files, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, alpha_mode=alpha_mode))
+        return
 
     image_files = []
-    valid_exts  = {".jpg", ".jpeg", ".png", ".webp"}
 
     if args.paths:
         for raw in args.paths:
@@ -778,13 +962,7 @@ def main():
             if input_path.is_file():
                 image_files.append(input_path)  # explicit file — always included
             elif input_path.is_dir():
-                # Directory expansion: skip our own output files
-                image_files.extend(
-                    p for p in input_path.iterdir()
-                    if p.is_file()
-                    and p.suffix.lower() in valid_exts
-                    and not any(s in p.stem for s in all_suffixes)
-                )
+                image_files.extend(_collect_images_from_dir(input_path, all_suffixes, valid_exts))
             else:
                 console.print(f"[red]Invalid path:[/red] {raw}")
                 return
