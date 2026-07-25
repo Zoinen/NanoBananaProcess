@@ -700,6 +700,21 @@ def _image_to_inline_part(img: Image.Image) -> dict:
     img.save(buf, format="PNG")
     return {"inline_data": {"mime_type": "image/png", "data": base64.b64encode(buf.getvalue()).decode("ascii")}}
 
+def _batch_status_line(model_key: str, batch_job) -> str:
+    """Build a Rich-formatted progress line for a batch job, including per-request counts when available."""
+    job_id = batch_job.name.split("/")[-1]
+    stats = getattr(batch_job, "batch_stats", None)
+    counts = ""
+    if stats is not None:
+        total = getattr(stats, "request_count", None)
+        ok = getattr(stats, "successful_request_count", None) or 0
+        failed = getattr(stats, "failed_request_count", None) or 0
+        if total:
+            counts = f"  {ok + failed}/{total} done"
+            if failed:
+                counts += f", {failed} failed"
+    return f"[dim]{model_key}[/dim]  job {job_id}: {batch_job.state.name}{counts}"
+
 async def _submit_google_batch_job(model_key: str, model_id: str, suffix: str, image_files: list[Path], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, alpha_mode: bool, progress: Progress):
     """Build, submit, poll, and save results for one model's Gemini Batch API job."""
     task_id = progress.add_task(f"[dim]{model_key}[/dim]  preparing batch…", total=None)
@@ -762,12 +777,12 @@ async def _submit_google_batch_job(model_key: str, model_id: str, suffix: str, i
         src=uploaded.name,
         config={"display_name": f"process-py-{model_key}-{uuid.uuid4().hex[:8]}"},
     )
-    progress.update(task_id, description=f"[dim]{model_key}[/dim]  job {batch_job.name.split('/')[-1]}: {batch_job.state.name}")
+    progress.update(task_id, description=_batch_status_line(model_key, batch_job))
 
     while batch_job.state.name not in _BATCH_TERMINAL_STATES:
         await asyncio.sleep(_BATCH_POLL_INTERVAL_SECONDS)
         batch_job = await asyncio.to_thread(google_client.batches.get, name=batch_job.name)
-        progress.update(task_id, description=f"[dim]{model_key}[/dim]  job {batch_job.name.split('/')[-1]}: {batch_job.state.name}")
+        progress.update(task_id, description=_batch_status_line(model_key, batch_job))
 
     if batch_job.state.name != "JOB_STATE_SUCCEEDED":
         progress.remove_task(task_id)
