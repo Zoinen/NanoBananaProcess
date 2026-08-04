@@ -527,7 +527,7 @@ async def _log_request(lock: asyncio.Lock, entry: dict):
                 f.write(line)
         await asyncio.to_thread(_write)
 
-async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore: asyncio.Semaphore, log_lock: asyncio.Lock, model_key: str, model_id: str, suffix: str, extra_prompt: str, override_prompt: str, image_size: str, aspect_ratio: str, progress: Progress, estimates: dict, transparent: bool = False, alpha_mode: bool = False):
+async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore: asyncio.Semaphore, log_lock: asyncio.Lock, model_key: str, model_id: str, suffix: str, extra_prompt: str, override_prompt: str, image_size: str, aspect_ratio: str, progress: Progress, estimates: dict, transparent: bool = False, alpha_mode: bool = False, name_index: int | None = None):
     """Asynchronously calls the API to generate/redraw an image and saves it."""
     # Build base path without extension — the call functions detect the real format
     if not image_paths:
@@ -535,7 +535,8 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
     elif len(image_paths) == 1:
         base_output = image_paths[0].with_name(f"{image_paths[0].stem}{suffix}{variant_idx}")
     else:
-        base_output = image_paths[0].with_name(f"{'+'.join(p.stem for p in image_paths)}{suffix}{variant_idx}")
+        name_source, stem = _combined_name_source(image_paths, name_index)
+        base_output = name_source.with_name(f"{stem}{suffix}{variant_idx}")
     output_path = base_output  # will be replaced with the real path after the call
 
     final_prompt = _build_prompt(extra_prompt, override_prompt, alpha_mode)
@@ -662,14 +663,26 @@ async def generate_variant(image_paths: list[Path], variant_idx: int, semaphore:
                 "error":            error_msg,
             })
 
-def _next_variant_index(image_paths: list[Path], suffix: str) -> int:
+def _combined_name_source(image_paths: list[Path], name_index: int | None) -> tuple[Path, str]:
+    """Return (path, stem) used to name the output of a multi-image (combined) request.
+
+    By default all input stems are joined with '+'. If name_index is given (1-based),
+    the output is named after only that one input file instead.
+    """
+    if name_index is not None:
+        target = image_paths[name_index - 1]
+        return target, target.stem
+    return image_paths[0], "+".join(p.stem for p in image_paths)
+
+def _next_variant_index(image_paths: list[Path], suffix: str, name_index: int | None = None) -> int:
     """Return the next available variant index for this image+suffix pair."""
     if not image_paths:
         directory, stem = Path.cwd(), "generated"
     elif len(image_paths) == 1:
         directory, stem = image_paths[0].parent, image_paths[0].stem
     else:
-        directory, stem = image_paths[0].parent, "+".join(p.stem for p in image_paths)
+        name_source, stem = _combined_name_source(image_paths, name_index)
+        directory = name_source.parent
     pattern = re.compile(
         rf"^{re.escape(stem)}{re.escape(suffix)}(\d+)\.(png|jpg|jpeg|webp)$",
         re.IGNORECASE,
@@ -846,7 +859,7 @@ async def run_google_batch(model_keys: list[str], image_files: list[Path], extra
 
     console.print("🎉 All batch jobs done!")
 
-async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False, alpha_mode: bool = False):
+async def async_main(image_files: list[Path], model_keys: list[str], extra_prompt: str, override_prompt: str, variants: int, image_size: str, aspect_ratio: str, transparent: bool = False, alpha_mode: bool = False, name_index: int | None = None):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     log_lock  = asyncio.Lock()
     estimates = _load_estimates()
@@ -878,9 +891,9 @@ async def async_main(image_files: list[Path], model_keys: list[str], extra_promp
             for model_key in model_keys:
                 model_id = MODEL_MAPPING[model_key]
                 suffix = SUFFIX_MAPPING[model_key]
-                start_idx = _next_variant_index(img_paths, suffix)
+                start_idx = _next_variant_index(img_paths, suffix, name_index)
                 for i in range(start_idx, start_idx + variants):
-                    tasks.append(generate_variant(img_paths, i, semaphore, log_lock, model_key, model_id, suffix, extra_prompt, override_prompt, image_size, aspect_ratio, progress, estimates, transparent=transparent, alpha_mode=alpha_mode))
+                    tasks.append(generate_variant(img_paths, i, semaphore, log_lock, model_key, model_id, suffix, extra_prompt, override_prompt, image_size, aspect_ratio, progress, estimates, transparent=transparent, alpha_mode=alpha_mode, name_index=name_index))
 
         console.print(f"Firing off {len(tasks)} requests...")
         await asyncio.gather(*tasks)
@@ -911,6 +924,8 @@ def main():
                         help="Alpha-mask mode: generate a grayscale alpha mask for the source image, then compose it with the source RGB into a final RGBA PNG.")
     parser.add_argument("--batch", type=str, default=None, metavar="FOLDER",
                         help="Batch mode: process every image in FOLDER via the Gemini Batch API (50%% cheaper, async — can take minutes to hours). Google models only (pro/flash/lite). Do not pass positional paths when using --batch.")
+    parser.add_argument("--name-index", type=int, default=None, metavar="N",
+                        help="When multiple images are combined into one request, name the output after the Nth input file (1-based) instead of joining all stems with '+'.")
     if len(sys.argv) == 1:
         parser.print_help()
         return
@@ -954,6 +969,8 @@ def main():
         if args.paths:
             console.print("[red]--batch cannot be combined with positional paths[/red] — pass only the folder via --batch.")
             return
+        if args.name_index is not None:
+            console.print("[yellow]Note:[/yellow] --name-index has no effect in --batch mode (each image is processed independently).")
         unsupported = [k for k in model_keys if k not in ("pro", "flash", "lite")]
         if unsupported:
             console.print(f"[red]--batch only supports Google models (pro/flash/lite)[/red] — unsupported: {', '.join(unsupported)}")
@@ -989,8 +1006,14 @@ def main():
         if not override_prompt and not extra_prompt:
             console.print("[yellow]Warning:[/yellow] no source image and no --prompt given — the default redraw prompt will be used as-is.")
 
+    if args.name_index is not None:
+        if len(image_files) <= 1:
+            console.print("[yellow]Note:[/yellow] --name-index has no effect with a single input image.")
+        elif not (1 <= args.name_index <= len(image_files)):
+            console.print(f"[red]--name-index {args.name_index} is out of range[/red] — {len(image_files)} input file(s) given.")
+            return
 
-    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, transparent=transparent, alpha_mode=alpha_mode))
+    asyncio.run(async_main(image_files, model_keys, extra_prompt, override_prompt, args.variants, image_size, aspect_ratio, transparent=transparent, alpha_mode=alpha_mode, name_index=args.name_index))
 
 if __name__ == "__main__":
     main()
